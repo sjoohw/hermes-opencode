@@ -1,6 +1,15 @@
 # Release verification
 
-> **Fork note.** These results were produced in the upstream repository [cryptobredda/hermes-opencode-free-acp](https://github.com/cryptobredda/hermes-opencode-free-acp) before this fork. They document the inherited 0.4.0 baseline. The fork's warm-bridge changes were verified locally with the offline suite (91 tests OK, 2 skipped) and a real ACP handshake using OpenCode 1.19.0.
+## Hermes OpenCode bridge
+
+- Native Windows: 84 offline tests passed. Hermes 0.23.2 plugin validation and doctor both registered the provider.
+- OpenCode 1.19.6: two simultaneous bridge clients completed ACP initialization and session creation. The first listener was observed on 127.0.0.1:4885.
+- The local OpenCode 2.0.32 CLI did not complete the required ACP handshake with `--pure`. Check the target executable with the smoke test.
+- The checks above did not send an inference request. A live model-driven Hermes tool round trip is still unverified for this fork.
+
+## Historical results from upstream
+
+The following sections refer to earlier implementations and model-selection behavior.
 
 ## v0.4.0 — cross-platform release
 

@@ -73,10 +73,19 @@ class IsolationAndSignatureTests(unittest.TestCase):
         self.assertNotIn("first answer", delta)
         self.assertNotIn("REMOTE TOOL PROTOCOL:", delta)
 
+    def test_preferred_port_startup_failure_retries_without_port(self):
+        item = acp.OpenCodeACPClient()
+        self.addCleanup(item.close)
+        with patch.object(acp, "BridgeWorker") as start:
+            start.side_effect = [acp.WorkerDied("unavailable"), start.return_value]
+            item._ensure_worker(2)
+            self.assertEqual([call.args[1] for call in start.call_args_list],
+                             [["acp", "--pure", "--port", "4885"], ["acp", "--pure"]])
+
     def test_default_command_line_is_pure(self):
         item = acp.OpenCodeACPClient()
         self.addCleanup(item.close)
-        self.assertEqual(item.args, ["acp", "--pure"])
+        self.assertEqual(item.args, ["acp", "--pure", "--port", "4885"])
 
 
 class WarmProcessTests(unittest.TestCase):

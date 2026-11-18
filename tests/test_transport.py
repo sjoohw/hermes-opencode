@@ -63,6 +63,15 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             acp.parse_tool_calls(envelope(), [])
 
+    def test_literal_tag_in_prose(self):
+        prose = "Use the `<hermes_tool_call>` tag."
+        self.assertEqual(acp.parse_tool_calls(prose, TOOLS), ([], prose))
+
+    def test_required_or_named_tool_cannot_return_only_prose(self):
+        for choice in ("required", {"type": "function", "function": {"name": "check_connection"}}):
+            with self.subTest(choice=choice), self.assertRaises(ValueError):
+                acp.parse_tool_calls("Done", TOOLS, choice)
+
     def test_incomplete_envelope_is_rejected(self):
         with self.assertRaises(ValueError):
             acp.parse_tool_calls(acp.OPEN_TAG + "{}", TOOLS)

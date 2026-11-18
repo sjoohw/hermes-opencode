@@ -12,9 +12,11 @@ hermes chat --provider hermes-opencode-acp --model opencode-default
 
 OpenCode uses the working directory passed to the client (otherwise the Hermes process working directory), its normal configuration and the process environment. Set `HERMES_OPENCODE_ACP_COMMAND` to the OpenCode CLI's absolute executable path if several installations are available. Hermes communicates with OpenCode over stdio. OpenCode manages its own model configuration and credentials.
 
+OpenCode CLI builds with an ACP HTTP listener are started with `--port 4885`. If the CLI exits during initialization, the bridge retries once using `acp --pure` and the CLI's normal port selection. Hermes always communicates over stdio. The installed CLI must support `--pure`.
+
 ## Tools and permissions
 
-Hermes receives structured tool requests reconstructed from OpenCode's text replies and applies its normal tool validation and approval flow. The bridge declines ACP permission requests and client-side filesystem and terminal requests. OpenCode's own configuration governs any native tools the CLI is already authorized to execute. The child CLI inherits environment variables available to Hermes, including credentials.
+Hermes receives structured tool requests reconstructed from OpenCode's text replies and applies its normal tool validation and approval flow. The bridge declines ACP permission requests and client-side filesystem and terminal requests. OpenCode's own configuration governs any native tools the CLI is already authorized to execute. To keep native shell and edit actions behind Hermes approvals, configure OpenCode to ask or deny those actions. The bridge declines native approval requests. The child CLI inherits environment variables available to Hermes, including credentials.
 
 ## Verification
 

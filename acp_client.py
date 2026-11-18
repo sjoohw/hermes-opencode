@@ -14,7 +14,7 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from .constants import DEFAULT_MODEL, VERSION, opencode_command
+from .constants import DEFAULT_ARGS, DEFAULT_MODEL, VERSION, opencode_command
 from .launcher import ProcessTree
 
 MAX_FRAME = 4 * 1024 * 1024
@@ -226,11 +226,17 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
                if isinstance(item, dict) and isinstance(item.get("function"), dict)
                and isinstance(item["function"].get("name"), str)}
     calls, prose, cursor, seen = [], [], 0, set()
+    search_from = cursor
     while True:
-        start = text.find(OPEN_TAG, cursor)
+        start = text.find(OPEN_TAG, search_from)
         if start < 0:
             prose.append(text[cursor:])
             break
+        # A standalone Markdown code span can name the protocol tag in normal prose.
+        if start > 0 and text[start - 1] == "`" and text.startswith("`", start + len(OPEN_TAG)):
+            # Look past quoted mentions while keeping the original prose slice intact.
+            search_from = start + len(OPEN_TAG)
+            continue
         prose.append(text[cursor:start])
         body_start = start + len(OPEN_TAG)
         body_start += len(text[body_start:]) - len(text[body_start:].lstrip())
@@ -257,6 +263,9 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
         calls.append(Record(id=call_id, type="function", call_id=call_id, response_item_id=None,
                             function=Record(name=function["name"], arguments=json.dumps(decoded, ensure_ascii=False))))
         cursor = end + len(CLOSE_TAG)
+        search_from = cursor
+    if not calls and (tool_choice == "required" or isinstance(tool_choice, dict)):
+        raise ValueError("The requested remote tool call is missing")
     return calls, "\n".join(part.strip() for part in prose if part.strip())
 
 
@@ -484,7 +493,7 @@ class OpenCodeACPClient:
 
     def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None, **kwargs):
         self.command = acp_command or command or opencode_command()
-        self.args = list(acp_args or args or ["acp", "--pure"])
+        self.args = list(acp_args or args or DEFAULT_ARGS)
         self.workspace = os.path.abspath(acp_cwd or os.getcwd())
         self.base_url = "acp://hermes-opencode-acp"
         self.chat = Record(completions=Record(create=self._create_chat_completion))
@@ -542,10 +551,21 @@ class OpenCodeACPClient:
                 spawned["owner"] = owner
                 self._register_owner(owner)
 
+            def start(args):
+                return BridgeWorker(self.command, args, cwd=self.workspace, env=os.environ.copy(),
+                                    initialize_timeout=min(timeout, 30.0), on_spawn=register)
+
             try:
-                worker = BridgeWorker(self.command, self.args, cwd=self.workspace,
-                                      env=os.environ.copy(),
-                                      initialize_timeout=min(timeout, 30.0), on_spawn=register)
+                try:
+                    worker = start(self.args)
+                except WorkerDied:
+                    # Some CLIs cannot bind the preferred port or accept a port flag.
+                    # Only retry initialization. No session or prompt exists yet.
+                    if tuple(self.args) != DEFAULT_ARGS or self._cancelled.is_set():
+                        raise
+                    with self._lock:
+                        self._processes.discard(spawned.get("owner"))
+                    worker = start(["acp", "--pure"])
             except BaseException:
                 with self._lock:
                     self._processes.discard(spawned.get("owner"))
