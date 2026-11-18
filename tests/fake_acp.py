@@ -12,13 +12,6 @@ for stream in (sys.stdin, sys.stdout):
 
 SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "normal"
 EXTRA = sys.argv[2] if len(sys.argv) > 2 else None
-MODEL = "opencode/glm-5.3-flash-free"
-CATALOG = (
-    MODEL,
-    "opencode/flint-40b-free",
-    "opencode/pulse-alpha-free",
-    "openai/paid-test-only",
-)
 SESSIONS = {}
 COUNTER = 0
 child = None
@@ -33,12 +26,14 @@ def send(message):
 
 
 def config(session_id):
+    if SCENARIO == "no-config":
+        return []
     values = SESSIONS[session_id]
     result = [
         {"id": "mode", "category": "mode", "currentValue": values["mode"],
          "options": [{"value": "plan"}] + ([] if SCENARIO == "missing-build" else [{"value": "build"}])},
         {"id": "model", "category": "model", "currentValue": values["model"],
-         "options": [{"value": model} for model in (CATALOG if SCENARIO == "catalog" else (MODEL, "openai/paid-test-only"))]},
+         "options": [{"value": model} for model in ("example/default-model", "example/other-model")]},
     ]
     if SCENARIO != "missing-effort":
         result.append({"id": "effort", "category": "thought_level",
@@ -65,18 +60,13 @@ for line in sys.stdin:
     elif method == "session/new":
         COUNTER += 1
         session_id = "fake-session-" + str(COUNTER)
-        values = {"mode": "plan", "model": "openai/paid-test-only"}
+        values = {"mode": "plan", "model": "example/default-model"}
         if SCENARIO != "missing-effort":
             values["effort"] = "high"
         SESSIONS[session_id] = values
         result = {"sessionId": session_id, "configOptions": config(session_id)}
     elif method == "session/set_config_option":
-        params = request["params"]
-        session_id = params["sessionId"]
-        values = SESSIONS[session_id]
-        if SCENARIO != "unconfirmed-model" or params["configId"] != "model":
-            values[params["configId"]] = params["value"]
-        result = {"configOptions": config(session_id)}
+        raise AssertionError("Bridge changed OpenCode session settings")
     elif method == "session/prompt":
         params = request["params"]
         session_id = params["sessionId"]

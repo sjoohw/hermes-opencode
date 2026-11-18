@@ -8,18 +8,15 @@ import json
 import math
 import os
 import queue
-import shutil
 import subprocess
-import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import uuid
 
-from .constants import DEFAULT_MODEL, FREE_MODELS, VERSION, WORKSPACE, opencode_command
+from .constants import DEFAULT_MODEL, VERSION, opencode_command
 from .launcher import ProcessTree
 
-BRIDGE_MODE = "build"
 MAX_FRAME = 4 * 1024 * 1024
 OPEN_TAG, CLOSE_TAG = "<hermes_tool_call>", "</hermes_tool_call>"
 CONTRACT = (
@@ -29,24 +26,10 @@ CONTRACT = (
     '{"name":"tool_name","arguments":"{...}"}}</hermes_tool_call> as your final TEXT response. '
     "arguments must be a JSON object encoded as a JSON string. Stop after requesting the tool; "
     "Hermes executes it AFTER your response and supplies the result in the next transcript. "
-    "Do NOT use native OpenCode tools, shell, files, skills, or subagents: those are blocked. "
-    "A blocked native tool does not mean the corresponding remote Hermes tool is unavailable. "
+    "Do NOT use native OpenCode tools, shell, files, skills, or subagents: leave execution to Hermes. "
     "Do not claim an action happened before a real tool result exists. If the transcript "
     "already contains the needed tool result, answer from it. If no tool is needed, answer normally."
 )
-# Only infrastructure/non-secret behavior values are forwarded. In particular,
-# no HERMES_*, vendor API keys, tokens, inline OpenCode configuration or YOLO
-# settings from the parent are inherited. The CLI owns its normal login in HOME.
-CHILD_ENV_NAMES = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-    "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "HOMEDRIVE", "HOMEPATH",
-    "TMPDIR", "TEMP", "TMP",
-    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
-    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TERM",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-})
 
 
 class Record(SimpleNamespace):
@@ -92,17 +75,6 @@ class _Active:
         self.sinks = sinks
 
 
-def child_environment():
-    return {key: value for key, value in os.environ.items() if key in CHILD_ENV_NAMES}
-
-
-def bridge_environment(config_home):
-    environment = child_environment()
-    environment["XDG_CONFIG_HOME"] = str(config_home)
-    os.makedirs(config_home, exist_ok=True)
-    return environment
-
-
 def effective_timeout(value):
     if isinstance(value, (int, float)):
         seconds = float(value)
@@ -143,11 +115,11 @@ def config_option(session, category, required=None):
     raise RuntimeError(f"OpenCode ACP required {category} {required!r} was not advertised; offered={offered!r}. No prompt was sent.")
 
 
-def optional_config_option(session, category, required=None):
-    for item in _config_candidates(session, category):
-        if required is None or required in options(item):
-            return item
-    return None
+def session_model(config):
+    for option in _config_candidates(config, "model"):
+        if option.get("currentValue"):
+            return option["currentValue"]
+    return (config.get("models") or {}).get("currentModelId") or DEFAULT_MODEL
 
 
 def selected_value(result, config_id):
@@ -510,10 +482,10 @@ class OpenCodeACPClient:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, **kwargs):
+    def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None, **kwargs):
         self.command = acp_command or command or opencode_command()
         self.args = list(acp_args or args or ["acp", "--pure"])
-        self.workspace = str(WORKSPACE)
+        self.workspace = os.path.abspath(acp_cwd or os.getcwd())
         self.base_url = "acp://hermes-opencode-acp"
         self.chat = Record(completions=Record(create=self._create_chat_completion))
         self.is_closed = False
@@ -522,7 +494,6 @@ class OpenCodeACPClient:
         self._processes = set()
         self._worker = None
         self._worker_lock = threading.Lock()
-        self._config_home = None
 
     def cancel(self):
         with self._lock:
@@ -542,10 +513,6 @@ class OpenCodeACPClient:
 
     def close(self):
         self.cancel()
-        config_home = self._config_home
-        self._config_home = None
-        if config_home:
-            shutil.rmtree(config_home, ignore_errors=True)
 
     def _register_owner(self, owner):
         with self._lock:
@@ -569,10 +536,6 @@ class OpenCodeACPClient:
             with self._lock:
                 if self._cancelled.is_set():
                     raise RuntimeError("OpenCode ACP request was cancelled")
-                config_home = self._config_home
-                if config_home is None:
-                    config_home = tempfile.mkdtemp(prefix="hermes-opencode-acp-")
-                    self._config_home = config_home
             spawned = {}
 
             def register(owner):
@@ -581,7 +544,7 @@ class OpenCodeACPClient:
 
             try:
                 worker = BridgeWorker(self.command, self.args, cwd=self.workspace,
-                                      env=bridge_environment(config_home),
+                                      env=os.environ.copy(),
                                       initialize_timeout=min(timeout, 30.0), on_spawn=register)
             except BaseException:
                 with self._lock:
@@ -611,44 +574,8 @@ class OpenCodeACPClient:
         with self._lock:
             self._processes.discard(worker.owner)
 
-    def list_models(self, *, timeout_seconds=15.0):
-        timeout = effective_timeout(timeout_seconds)
-        for attempt in (0, 1):
-            worker = None
-            try:
-                worker = self._ensure_worker(timeout)
-                with worker.rpc_lock:
-                    session = worker.new_session(timeout)
-                    offered = set(options(config_option(session, "model")))
-                    return [model for model in FREE_MODELS if model in offered]
-            except WorkerDied:
-                if worker is not None:
-                    self._discard_worker(worker)
-                if attempt == 1:
-                    raise
-
-    def _select_config(self, worker, session, option, value, timeout, *, required):
-        if option.get("currentValue") == value:
-            return
-        result = worker.request("session/set_config_option",
-                                {"sessionId": session.session_id, "configId": option["id"], "value": value},
-                                timeout=timeout)
-        session.config = result
-        if required and selected_value(result, option["id"]) != value:
-            raise RuntimeError(f"OpenCode did not confirm requested {option['id']}={value!r}; no prompt was sent")
-
-    def _prompt_session(self, worker, session, messages, start, *, model, tools, tool_choice, timeout):
+    def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
         prompt = render_prompt(messages, tools, tool_choice) if start == 0 else render_delta(messages, start)
-        mode = config_option(session.config, "mode", BRIDGE_MODE)
-        chosen = config_option(session.config, "model", model)
-        effort = optional_config_option(session.config, "effort", "low")
-        self._select_config(worker, session, mode, BRIDGE_MODE, timeout, required=True)
-        self._select_config(worker, session, chosen, model, timeout, required=True)
-        if effort is not None:
-            try:
-                self._select_config(worker, session, effort, "low", timeout, required=False)
-            except RpcError:
-                pass
         text, reasoning = [], []
         worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}]},
                        sinks=(text, reasoning), timeout=timeout)
@@ -657,13 +584,13 @@ class OpenCodeACPClient:
             raise RuntimeError("OpenCode returned no assistant text; not treating this as success")
         return answer, "".join(reasoning)
 
-    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, model, tools, tool_choice, timeout):
+    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, timeout):
         with worker.rpc_lock:
             session, start = worker.match_session(signatures, tools_signature)
             if session is not None:
                 try:
                     answer, reasoning = self._prompt_session(worker, session, messages, start,
-                                                             model=model, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                                                             tools=tools, tool_choice=tool_choice, timeout=timeout)
                     return answer, reasoning, worker, session
                 except RpcError:
                     worker.forget(session)
@@ -673,15 +600,13 @@ class OpenCodeACPClient:
             session = worker.add_session(worker.new_session(timeout), tools_signature)
             try:
                 answer, reasoning = self._prompt_session(worker, session, messages, 0,
-                                                         model=model, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                                                         tools=tools, tool_choice=tool_choice, timeout=timeout)
                 return answer, reasoning, worker, session
             except BaseException:
                 worker.forget(session)
                 raise
 
-    def _run_prompt(self, messages, *, model, tools, tool_choice, timeout_seconds):
-        if model not in FREE_MODELS:
-            raise ValueError(f"OpenCode ACP refuses an unapproved or paid model: {model!r}")
+    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds):
         timeout = effective_timeout(timeout_seconds)
         messages = messages or []
         signatures = [message_signature(message) for message in messages]
@@ -692,14 +617,14 @@ class OpenCodeACPClient:
                 worker = self._ensure_worker(timeout)
                 answer, reasoning, worker, session = self._prompt_on_worker(
                     worker, messages, signatures, tools_signature,
-                    model=model, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                    tools=tools, tool_choice=tool_choice, timeout=timeout)
                 try:
                     calls, content = parse_tool_calls(answer, tools, tool_choice)
                 except BaseException:
                     worker.forget(session)
                     raise
                 worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
-                return calls, content, reasoning
+                return calls, content, reasoning, session_model(session.config)
             except WorkerDied:
                 if worker is not None:
                     self._discard_worker(worker)
@@ -714,8 +639,7 @@ class OpenCodeACPClient:
 
     def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
                                 timeout=None, stream=False, **kwargs):
-        model = model or DEFAULT_MODEL
-        calls, content, reasoning = self._run_prompt(messages, model=model, tools=tools,
+        calls, content, reasoning, model = self._run_prompt(messages, tools=tools,
                                                      tool_choice=tool_choice, timeout_seconds=timeout)
         message = Record(role="assistant", content=content, tool_calls=calls,
                          reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)

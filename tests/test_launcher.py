@@ -193,15 +193,6 @@ class LaunchTests(unittest.TestCase):
         job.stop.assert_called_once()
         job.close.assert_called_once()
 
-    def test_windows_home_environment_survives_but_credentials_do_not(self):
-        values = {"HOMEDRIVE": "C:", "HOMEPATH": "\\Users\\test", "APPDATA": "test-roaming",
-                  "LOCALAPPDATA": "test-local", "SYSTEMROOT": "test-windows", "PATHEXT": ".EXE;.CMD",
-                  "OPENAI_API_KEY": "SYNTHETIC_NOT_A_CREDENTIAL", "HERMES_YOLO_MODE": "1"}
-        with patch.dict(os.environ, values, clear=True):
-            actual = acp.child_environment()
-        self.assertEqual(actual, {key: value for key, value in values.items()
-                                  if key not in ("OPENAI_API_KEY", "HERMES_YOLO_MODE")})
-
 
 class PortableStdioTests(unittest.TestCase):
     def complete(self, item, text="synthetic offline request"):
@@ -221,7 +212,10 @@ class PortableStdioTests(unittest.TestCase):
             shutil.copyfile(ROOT / "tests/fake_acp.py", server)
             item = acp.OpenCodeACPClient(command=sys.executable, args=[str(server)])
             item.workspace = directory
-            self.assertEqual(self.complete(item).choices[0].message.content, "FAKE_ACP_OK")
+            try:
+                self.assertEqual(self.complete(item).choices[0].message.content, "FAKE_ACP_OK")
+            finally:
+                item.close()
 
     @unittest.skipUnless(sys.platform == "win32", "requires a real Windows cmd.exe and process API")
     def test_real_windows_batch_wrappers_with_spaces_unicode_and_metacharacters(self):
@@ -253,6 +247,7 @@ class PortableStdioTests(unittest.TestCase):
         item = acp.OpenCodeACPClient(command=sys.executable, args=[str(ROOT / "tests/fake_acp.py"), "descendant"])
         reply = self.complete(item).choices[0].message.content
         pid = int(reply.removeprefix("FAKE_CHILD_PID:"))
+        item.close()
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel.OpenProcess.restype = wintypes.HANDLE

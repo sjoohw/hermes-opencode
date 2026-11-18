@@ -3,9 +3,9 @@ name: hermes-opencode-acp
 kind: model-provider
 version: 0.4.0
 requires_hermes: ">=0.22.2"
-description: Real OpenCode ACP inference with Hermes-owned tools and curated free models
-author: engida32
-homepage: https://github.com/engida32/hermes-opencode-acp
+description: Connect Hermes to your installed OpenCode CLI via ACP
+author: sjoohw
+homepage: https://github.com/sjoohw/hermes-opencode
 license: MIT
-tags: [opencode, acp, model-provider, free-models]
+tags: [opencode, acp, model-provider]
 capabilities: []

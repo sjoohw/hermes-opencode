@@ -41,5 +41,5 @@ jobs:
         run: npm --version
       - name: Install the pinned official CLI in a job-local directory
         run: npm install --prefix .opencode-runtime --no-audit --no-fund @opencode/cli@2.1.2
-      - name: Verify actual npm launcher, ACP handshake and free-model/Build selection
+      - name: Verify actual npm launcher, ACP handshake and session defaults
         run: python tests/smoke_cli.py --npm-prefix .opencode-runtime

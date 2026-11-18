@@ -35,26 +35,16 @@ def complete(client, messages=None, tools=None, timeout=5):
 
 
 class IsolationAndSignatureTests(unittest.TestCase):
-    def test_bridge_environment_uses_private_config_home_and_drops_secrets(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_home = os.path.join(tmp, "config")
-            fixture = {
-                "PATH": "/test-path",
-                "HOME": "/test-home",
-                "XDG_CONFIG_HOME": "/global/config",
-                "OPENCODE_CONFIG_CONTENT": "private test config",
-                "OPENAI_API_KEY": "NOT_A_REAL_TOKEN",
-                "HERMES_YOLO_MODE": "1",
-            }
-            with patch.dict(os.environ, fixture, clear=True):
-                environment = acp.bridge_environment(config_home)
-            self.assertEqual(environment["XDG_CONFIG_HOME"], config_home)
-            self.assertTrue(os.path.isdir(config_home))
-            self.assertEqual(environment["HOME"], "/test-home")
-            self.assertEqual(environment["PATH"], "/test-path")
-            self.assertNotIn("OPENCODE_CONFIG_CONTENT", environment)
-            self.assertNotIn("OPENAI_API_KEY", environment)
-            self.assertNotIn("HERMES_YOLO_MODE", environment)
+    def test_worker_inherits_opencode_config_and_cwd(self):
+        item = fake()
+        self.addCleanup(item.close)
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/site/config", "OPENCODE_CONFIG": "/site/opencode.json"}):
+            with patch.object(acp, "BridgeWorker") as worker:
+                item._ensure_worker(2)
+                kwargs = worker.call_args.kwargs
+                self.assertEqual(kwargs["env"]["XDG_CONFIG_HOME"], "/site/config")
+                self.assertEqual(kwargs["env"]["OPENCODE_CONFIG"], "/site/opencode.json")
+                self.assertEqual(kwargs["cwd"], os.getcwd())
 
     def test_message_signature_ignores_presentation_fields(self):
         first = {
@@ -82,13 +72,6 @@ class IsolationAndSignatureTests(unittest.TestCase):
         self.assertNotIn("first request", delta)
         self.assertNotIn("first answer", delta)
         self.assertNotIn("REMOTE TOOL PROTOCOL:", delta)
-
-    def test_optional_config_option_returns_none_when_absent_or_unoffered(self):
-        session = {"configOptions": [{"id": "effort", "category": "thought_level",
-                                      "currentValue": "high", "options": [{"value": "low"}, {"value": "high"}]}]}
-        self.assertEqual(acp.optional_config_option(session, "effort", "low")["id"], "effort")
-        self.assertIsNone(acp.optional_config_option(session, "effort", "max"))
-        self.assertIsNone(acp.optional_config_option({"configOptions": []}, "effort", "low"))
 
     def test_default_command_line_is_pure(self):
         item = acp.OpenCodeACPClient()
@@ -174,11 +157,11 @@ class WarmProcessTests(unittest.TestCase):
         self.assertNotEqual(lines[0]["sessionId"], lines[1]["sessionId"])
         self.assertIn("check_connection", lines[1]["prompt"])
 
-    def test_effort_low_is_selected_when_advertised(self):
+    def test_session_defaults_are_preserved(self):
         path = self.temp_path()
         item = self.use("record", path)
         complete(item)
-        self.assertEqual(self.lines(path)[0]["values"]["effort"], "low")
+        self.assertEqual(self.lines(path)[0]["values"], {"mode": "plan", "model": "example/default-model", "effort": "high"})
 
     def test_missing_effort_option_is_tolerated(self):
         path = self.temp_path()
@@ -192,13 +175,6 @@ class WarmProcessTests(unittest.TestCase):
         self.assertEqual(content(complete(item)), "OK")
         self.assertEqual(len(item._processes), 1)
         self.assertTrue(os.path.exists(marker))
-
-    def test_paid_or_unknown_model_fails_before_spawn(self):
-        for model in ("openai/paid-test-only", "opencode/invented-free"):
-            item = self.use()
-            with patch.object(item, "_ensure_worker") as ensure, self.assertRaises(ValueError):
-                item.chat.completions.create(model=model, messages=[])
-            ensure.assert_not_called()
 
 
 if __name__ == "__main__":
