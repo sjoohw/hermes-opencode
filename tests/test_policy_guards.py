@@ -3,6 +3,9 @@ import json
 import os
 import sys
 import tempfile
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +44,48 @@ class GuardTests(unittest.TestCase):
 
     def test_refused_native_tool_does_not_fail_the_turn(self):
         self.assertEqual(self.complete(self.use("native-refused")).choices[0].message.content, "FAKE_ACP_OK")
+
+    def test_only_confirmed_missing_session_before_output_replays(self):
+        for scenario in ("quota", "auth", "partial-missing", "missing"):
+            path = self.temp_path()
+            item = self.use(scenario, path)
+            msgs = [{"role": "user", "content": "first"}]
+            first = item.chat.completions.create(messages=msgs)
+            msgs.extend([first.choices[0].message, {"role": "user", "content": "second"}])
+            with self.subTest(scenario=scenario), patch.dict(os.environ, {"HERMES_OPENCODE_ACP_DIAGNOSTICS": "1"}):
+                if scenario == "missing":
+                    item.chat.completions.create(messages=msgs)
+                elif scenario == "partial-missing":
+                    with self.assertRaises(acp.RpcError):
+                        item.chat.completions.create(messages=msgs)
+                else:
+                    with self.assertLogs(acp._log) as logs, self.assertRaises(acp.RpcError) as error:
+                        item.chat.completions.create(messages=msgs)
+                    self.assertIn("provider." + scenario, str(logs.output))
+                    self.assertNotIn("SECRET", str(logs.output) + str(error.exception))
+                self.assertEqual(len(Path(path).read_text().splitlines()), 3 if scenario == "missing" else 2)
+
+    def test_repaired_usage_is_final_request_for_both_response_modes(self):
+        for stream in (False, True):
+            item = self.use("bad-tool-once", self.temp_path())
+            result = item.chat.completions.create(messages=[{"role": "user", "content": "check"}],
+                                                  tools=TOOLS, stream=stream)
+            usage = (result[-1] if stream else result).usage
+            self.assertEqual((usage.prompt_tokens, usage.completion_tokens, usage.total_tokens), (232, 8, 240))
+            self.assertEqual(usage.prompt_tokens_details.cached_tokens, 32)
+            self.assertEqual(usage.completion_tokens_details.reasoning_tokens, 3)
+
+    def test_cancel_notifies_active_session_before_process_exit(self):
+        path = Path(self.temp_path())
+        item = self.use("cancel-aware", str(path))
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(self.complete, item)
+            deadline = time.monotonic() + 3
+            while not path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            item.cancel()
+            self.assertIsInstance(future.exception(timeout=3), RuntimeError)
+            self.assertEqual(path.read_text(), "prompt cancelled")
 
     def test_malformed_tool_call_is_repaired_once_in_session(self):
         path = self.temp_path()

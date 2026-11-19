@@ -1,5 +1,23 @@
 # Release verification
 
+## 0.5.0 working tree, 2026-11-19
+
+The user reported that Mattermost worked after commit `b28d035`. Profile used for that report: unconfirmed. Installed plugin revision: unconfirmed. The earlier Windows image-follow-up experiment used `mm-luna-lab`. The working tree was tested separately without replacing that profile or installing a sign-in task.
+
+- All 117 offline tests passed. Hermes plugin doctor confirmed manifest 0.5.0, import, runtime discovery and provider registration.
+- Real ACP handshakes and `tests/smoke_cli.py --list-models` succeeded on 1.19.6 and 2.0.32. Both reported bridge version 0.5.0.
+- Both CLIs returned JSON-RPC code `-32602`, the exact missing session ID in `data.sessionId`, and the same missing-session message for an unknown ID. Only this observed pre-output response permits replay on a fresh session.
+- Two consecutive prompts in one session showed per-prompt output counts dropping from 16 to 5 (1.19.6) and from 17 to 5 (2.0.32). Both reported cached reads separately from input on the second call. For one 2.0.32 response, 5,014 input + 2,048 cached input + 6 output = 7,068 total. Hermes normalized this to 7,062 prompt tokens. Its compressor stayed below a test threshold of 7,063 and triggered at that threshold. The reasoning breakdown and correction path were checked using synthetic usage.
+- With the installed Hermes Python and the checkout on `PYTHONPATH`, `python tools/eval_compaction.py` runs a deterministic synthetic handoff through the real Hermes compressor and tests it with the OpenCode-selected examiner. To compare another candidate, use `--profile-compression` with an isolated profile configured for that candidate and keep the examiner's OpenCode configuration fixed. Exact-ID grading and questions stay fixed. A failed compaction or facts outside the archived region invalidate the run.
+
+| Luna compression / Luna examiner | Retained context (estimated tokens) | Constraint, reason, failed trial, next ticket | Correct follow-up ticket |
+|---|---:|---|---|
+| Uncompressed control | 38,039 | 4/4 | Yes |
+| Compressed, no history search | 5,819 | 4/4 | Yes |
+| Compressed, with history search | 5,819 before adding search excerpts | 4/4 | Yes |
+
+This single synthetic case measures recall of operational identifiers. Incremental output remains deferred while the bridge validates complete tool envelopes and native tool events.
+
 ## Hermes OpenCode bridge
 
 Checked on 2026-11-19 on native Windows 11 with Python 3.13.5 and Hermes 0.23.2. OpenCode 1.19.6 was the global install. OpenCode 2.0.32 was installed separately with `npm install --prefix`. Both used the OpenCode-selected model `openai/gpt-6-luna`.

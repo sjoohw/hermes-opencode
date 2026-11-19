@@ -6,19 +6,30 @@ work is returned as remote tool calls; this module never executes model tools.
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
 from types import SimpleNamespace
 import uuid
 
-from .constants import (DEFAULT_ARGS, DEFAULT_MODEL, FALLBACK_ARGS, RELAY_AGENT, VERSION, opencode_agent,
+from .constants import (ARGS_ENV, DEFAULT_ARGS, DEFAULT_MODEL, FALLBACK_ARGS, RELAY_AGENT, VERSION, opencode_agent,
                         opencode_args, opencode_command)
 from .launcher import ProcessTree
+
+_startup_args = {}
+_startup_lock = threading.Lock()
+_log = logging.getLogger(__name__)
+
+
+def diagnostics_enabled():
+    return os.getenv("HERMES_OPENCODE_ACP_DIAGNOSTICS") == "1"
+
 
 MAX_FRAME = 4 * 1024 * 1024
 OPEN_TAG, CLOSE_TAG = "<hermes_tool_call>", "</hermes_tool_call>"
@@ -54,6 +65,26 @@ class Record(SimpleNamespace):
         return dump(self)
 
 
+def completion_usage(raw):
+    if not isinstance(raw, dict):
+        return None
+    inputs, outputs, total = (raw.get(k) for k in ("inputTokens", "outputTokens", "totalTokens"))
+    read, written, thought = (raw.get(k, 0) for k in ("cachedReadTokens", "cachedWriteTokens", "thoughtTokens"))
+    if any(type(v) is not int or v < 0 for v in (inputs, outputs, total, read, written, thought)):
+        return None
+    # Resolve inclusive/exclusive counters against the reported total. An ambiguous
+    # breakdown cannot provide a reliable compression anchor.
+    pairs = {(p, c) for p in (inputs, inputs + read + written)
+             for c in (outputs, outputs + thought)
+             if p + c == total and p >= read + written and c >= thought}
+    if len(pairs) != 1:
+        return None
+    prompt, completion = pairs.pop()
+    return Record(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total,
+                  prompt_tokens_details=Record(cached_tokens=read),
+                  completion_tokens_details=Record(reasoning_tokens=thought))
+
+
 class WorkerDied(RuntimeError):
     """The ACP process exited or its stdio closed before a response arrived."""
     # False once the turn produced output: resending could repeat inference.
@@ -66,7 +97,8 @@ class NativeToolUsed(RuntimeError):
 
 class RpcError(RuntimeError):
     """A JSON-RPC error response. Vendor text is never echoed or logged."""
-    def __init__(self, method, code):
+    def __init__(self, method, code, *, missing_session=False):
+        self.missing_session = missing_session
         super().__init__(f"OpenCode ACP {method} failed (code {code}); vendor error text was not logged")
         self.method = method
         self.code = code
@@ -87,6 +119,7 @@ class _Active:
         self.session_id = session_id
         self.sinks = sinks
         self.saw_update = False
+        self.finished = threading.Event()
 
 
 def effective_timeout(value):
@@ -473,11 +506,24 @@ class BridgeWorker:
                 if message.get("id") != rid:
                     continue
                 if "error" in message:
-                    code = (message.get("error") or {}).get("code", "unknown")
-                    raise RpcError(method, code)
+                    error = message["error"]
+                    error = error if isinstance(error, dict) else {}
+                    code = error.get("code")
+                    code = code if type(code) is int else "unknown"
+                    data = error.get("data")
+                    data = data if isinstance(data, dict) else {}
+                    name = data.get("errorName")
+                    if diagnostics_enabled() and name in ("provider.quota", "provider.auth"):
+                        _log.warning("OpenCode ACP %s failed: %s", method, name)
+                    sid = active.session_id
+                    missing = (method == "session/prompt" and code == -32602 and sid
+                               and data.get("sessionId") == sid and not active.saw_update
+                               and error.get("message") == f"Invalid params: session not found: {sid}")
+                    raise RpcError(method, code, missing_session=bool(missing))
                 return message.get("result") or {}
         finally:
             with self._state_lock:
+                active.finished.set()
                 if self._active is not None and self._active.rid == rid:
                     self._active = None
 
@@ -533,7 +579,8 @@ class BridgeWorker:
             if native is not None:
                 call_id = str(update.get("toolCallId", len(native)))
                 previous = native.get(call_id, ("pending", None))
-                native[call_id] = (update.get("status") or previous[0], update.get("kind") or previous[1])
+                status = previous[0] if previous[0] in NATIVE_RAN else update.get("status") or previous[0]
+                native[call_id] = (status, update.get("kind") or previous[1])
             return
         sink = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}.get(kind)
         content = update.get("content") or {}
@@ -585,6 +632,23 @@ class BridgeWorker:
         session.represented = list(signatures) + [message_signature(assistant)]
         session.last_used = time.monotonic()
 
+    def cancel_prompt(self):
+        with self._state_lock:
+            active = self._active
+            if active is None or active.sinks is None:
+                return
+
+        def notify():
+            try:
+                self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                            "params": {"sessionId": active.session_id}})
+            except (WorkerDied, OSError, ValueError):
+                pass
+
+        # A stalled pipe must never delay process-tree termination.
+        threading.Thread(target=notify, daemon=True).start()
+        active.finished.wait(0.25)
+
     def close(self):
         with self._close_lock:
             if self._closed:
@@ -623,6 +687,7 @@ class OpenCodeACPClient:
     def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None,
                  agent=None, **kwargs):
         self.command = acp_command or command or opencode_command()
+        self._auto_args = not (acp_args or args or os.getenv(ARGS_ENV, "").strip())
         self.args = list(acp_args or args or opencode_args())
         self.agent = agent or opencode_agent()
         self.workspace = os.path.abspath(acp_cwd or os.getcwd())
@@ -643,6 +708,8 @@ class OpenCodeACPClient:
             self._processes.clear()
             worker = self._worker
             self._worker = None
+        if worker is not None:
+            worker.cancel_prompt()
         for owner in processes:
             try:
                 owner.stop()
@@ -687,11 +754,24 @@ class OpenCodeACPClient:
                                     initialize_timeout=min(timeout, 30.0), on_spawn=register)
 
             try:
-                candidates = [self.args] + ([list(args) for args in FALLBACK_ARGS]
-                                            if tuple(self.args) == DEFAULT_ARGS else [])
+                candidates = [self.args]
+                if self._auto_args:
+                    key = os.path.normcase(os.path.realpath(shutil.which(self.command) or self.command))
+                    try:
+                        stat = os.stat(key)
+                        identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                    except OSError:
+                        identity = None
+                    with _startup_lock:
+                        saved_identity, saved_args = _startup_args.get(key, (None, DEFAULT_ARGS))
+                    preferred = saved_args if saved_identity == identity else DEFAULT_ARGS
+                    candidates = [list(a) for a in dict.fromkeys((preferred, DEFAULT_ARGS, *FALLBACK_ARGS))]
                 for index, args in enumerate(candidates):
                     try:
                         worker = start(args)
+                        if self._auto_args:
+                            with _startup_lock:
+                                _startup_args[key] = (identity, tuple(args))
                         break
                     except WorkerDied:
                         # Some CLIs reject the port or --pure flag. Only initialization
@@ -731,8 +811,10 @@ class OpenCodeACPClient:
     @staticmethod
     def _send_prompt(worker, session, prompt, timeout, images=()):
         text, reasoning, native = [], [], {}
-        worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
+        response = worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
                        sinks=(text, reasoning, native), timeout=timeout)
+        if response.get("stopReason") == "cancelled":
+            raise RuntimeError("OpenCode ACP request was cancelled")
         ran = sorted({str(kind or "unknown") for status, kind in native.values() if status in NATIVE_RAN})
         if ran:
             raise NativeToolUsed(f"OpenCode ran native tools outside Hermes approval (kinds: {', '.join(ran)}); "
@@ -740,7 +822,7 @@ class OpenCodeACPClient:
         answer = "".join(text)
         if not answer.strip():
             raise RuntimeError("OpenCode returned no assistant text; not treating this as success")
-        return answer, "".join(reasoning)
+        return answer, "".join(reasoning), completion_usage(response.get("usage"))
 
     def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
         supported = worker.image_input
@@ -759,14 +841,24 @@ class OpenCodeACPClient:
                 content = _plain(message).get("content")
                 if isinstance(content, list):
                     images.extend(block for item in content if (block := image_block(item)))
-        answer, reasoning = self._send_prompt(worker, session, prompt, timeout, images)
+        answer, reasoning, usage = self._send_prompt(worker, session, prompt, timeout, images)
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
             # One in-session correction; the rejected reply never reaches Hermes.
-            answer, reasoning = self._send_prompt(worker, session, REPAIR.format(reason=exc), timeout)
+            initial = usage
+            try:
+                answer, reasoning, usage = self._send_prompt(worker, session, REPAIR.format(reason=exc), timeout)
+            except RpcError as repair_error:
+                repair_error.missing_session = False
+                raise
+            except WorkerDied as repair_error:
+                repair_error.retryable = False
+                raise
+            if diagnostics_enabled() and initial and usage:
+                _log.info("OpenCode ACP corrected turn total tokens: %d", initial.total_tokens + usage.total_tokens)
             calls, content = parse_tool_calls(answer, tools, tool_choice)
-        return calls, content, reasoning
+        return calls, content, reasoning, usage
 
     def _open_session(self, worker, tools_signature, timeout):
         result = worker.new_session(timeout)
@@ -791,19 +883,21 @@ class OpenCodeACPClient:
             session, start = worker.match_session(signatures, tools_signature)
             if session is not None:
                 try:
-                    calls, content, reasoning = self._prompt_session(
+                    calls, content, reasoning, usage = self._prompt_session(
                         worker, session, messages, start, tools=tools, tool_choice=tool_choice, timeout=timeout)
-                    return calls, content, reasoning, session
-                except RpcError:
+                    return calls, content, reasoning, usage, session
+                except RpcError as exc:
                     worker.forget(session)
+                    if not exc.missing_session:
+                        raise
                 except BaseException:
                     worker.forget(session)
                     raise
             session = self._open_session(worker, tools_signature, timeout)
             try:
-                calls, content, reasoning = self._prompt_session(
+                calls, content, reasoning, usage = self._prompt_session(
                     worker, session, messages, 0, tools=tools, tool_choice=tool_choice, timeout=timeout)
-                return calls, content, reasoning, session
+                return calls, content, reasoning, usage, session
             except BaseException:
                 worker.forget(session)
                 raise
@@ -817,17 +911,19 @@ class OpenCodeACPClient:
             worker = None
             try:
                 worker = self._ensure_worker(timeout)
-                calls, content, reasoning, session = self._prompt_on_worker(
+                calls, content, reasoning, usage, session = self._prompt_on_worker(
                     worker, messages, signatures, tools_signature,
                     tools=tools, tool_choice=tool_choice, timeout=timeout)
+                if self._cancelled.is_set():
+                    raise RuntimeError("OpenCode ACP request was cancelled")
                 worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
-                return calls, content, reasoning, session_model(session.config)
+                return calls, content, reasoning, usage, session_model(session.config)
             except WorkerDied as exc:
                 if worker is not None:
                     self._discard_worker(worker)
                 if self._cancelled.is_set():
                     raise RuntimeError("OpenCode ACP request was cancelled")
-                # Respawn only when the lost turn produced nothing, so it is never billed twice.
+                # Respawn only when the lost turn produced nothing, as observed by the bridge.
                 if attempt == 1 or not exc.retryable:
                     raise
             except TimeoutError:
@@ -850,16 +946,16 @@ class OpenCodeACPClient:
 
     def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
                                 timeout=None, stream=False, **kwargs):
-        calls, content, reasoning, model = self._run_prompt(messages, tools=tools,
+        calls, content, reasoning, usage, model = self._run_prompt(messages, tools=tools,
                                                      tool_choice=tool_choice, timeout_seconds=timeout)
         message = Record(role="assistant", content=content, tool_calls=calls,
                          reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)
         result = Record(id="acp_" + uuid.uuid4().hex, object="chat.completion", created=int(time.time()), model=model,
-                        choices=[Record(index=0, message=message, finish_reason="tool_calls" if calls else "stop")], usage=None)
+                        choices=[Record(index=0, message=message, finish_reason="tool_calls" if calls else "stop")], usage=usage)
         if not stream:
             return result
         deltas = [Record(index=index, id=call.id, type="function", function=call.function) for index, call in enumerate(calls)]
         delta = Record(role="assistant", content=content or None, tool_calls=deltas or None,
                        reasoning_content=reasoning or None, reasoning=reasoning or None)
         return [Record(id=result.id, model=model, created=result.created, choices=[Record(index=0, delta=delta,
-                       finish_reason=result.choices[0].finish_reason)], usage=None)]
+                       finish_reason=result.choices[0].finish_reason)], usage=usage)]

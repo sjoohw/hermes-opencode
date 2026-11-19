@@ -94,6 +94,28 @@ for line in sys.stdin:
             time.sleep(30)
         if SCENARIO == "exit":
             sys.exit(3)
+        if SCENARIO in ("quota", "auth", "missing", "partial-missing"):
+            with open(EXTRA, "a") as handle:
+                handle.write("prompt\n")
+            if PROMPTS == 2:
+                error = {"code": -32602, "message": f"Invalid params: session not found: {session_id}",
+                         "data": {"sessionId": session_id}}
+                if SCENARIO in ("quota", "auth"):
+                    error = {"code": -32000, "message": "SECRET_PROMPT_AUTH",
+                             "data": {"errorName": "provider." + SCENARIO, "extra": "data:image/png;base64,SECRET"}}
+                if SCENARIO == "partial-missing":
+                    update(session_id, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "partial"}})
+                send({"jsonrpc": "2.0", "id": rid, "error": error})
+                continue
+        if SCENARIO == "cancel-aware":
+            with open(EXTRA, "w") as handle:
+                handle.write("prompt")
+            notification = json.loads(sys.stdin.readline())
+            assert notification["method"] == "session/cancel" and notification["params"]["sessionId"] == session_id
+            with open(EXTRA, "a") as handle:
+                handle.write(" cancelled")
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+            continue
         if SCENARIO == "rpc-error":
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "TEST_SENSITIVE_TEXT_MUST_NOT_BE_LOGGED"}})
             continue
@@ -145,6 +167,9 @@ for line in sys.stdin:
         if text:
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}}})
         result = {"stopReason": "end_turn"}
+        if SCENARIO == "bad-tool-once":
+            result["usage"] = {"inputTokens": PROMPTS * 100, "cachedReadTokens": 32, "thoughtTokens": 3,
+                               "outputTokens": 5, "totalTokens": PROMPTS * 100 + 40}
     else:
         raise AssertionError("Unexpected synthetic request: " + str(method))
     send({"jsonrpc": "2.0", "id": rid, "result": result})

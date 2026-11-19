@@ -35,6 +35,9 @@ def complete(client, messages=None, tools=None, timeout=5):
 
 
 class IsolationAndSignatureTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(acp._startup_args, clear=True))
+
     def test_worker_inherits_opencode_config_and_cwd(self):
         item = fake()
         self.addCleanup(item.close)
@@ -89,6 +92,16 @@ class IsolationAndSignatureTests(unittest.TestCase):
             start.side_effect = [acp.WorkerDied("no port"), acp.WorkerDied("no --pure"), start.return_value]
             item._ensure_worker(2)
             self.assertEqual(start.call_args_list[-1].args[1], ["acp"])
+
+    def test_cached_args_apply_only_to_auto_discovery(self):
+        for previous, expected in ((None, [["acp", "--pure", "--port", "4885"], ["acp", "--pure"], ["acp"]]),
+                                   (None, [["acp"]]), (constants.DEFAULT_ARGS, [list(constants.DEFAULT_ARGS)])):
+            item = acp.OpenCodeACPClient(command="selected-test-cli", args=previous)
+            self.addCleanup(item.close)
+            with patch.object(acp, "BridgeWorker") as start:
+                start.side_effect = [acp.WorkerDied("unsupported")] * (len(expected) - 1) + [start.return_value]
+                item._ensure_worker(2)
+                self.assertEqual([c.args[1] for c in start.call_args_list], expected)
 
     def test_default_command_line_is_pure(self):
         item = acp.OpenCodeACPClient()

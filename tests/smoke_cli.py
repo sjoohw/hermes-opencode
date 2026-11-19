@@ -18,6 +18,7 @@ def main():
     source.add_argument("--command", help="Operator-selected OpenCode executable")
     source.add_argument("--npm-prefix", type=Path, help="Test an npm install's actual platform-specific .bin launcher")
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--list-models", action="store_true", help="Include advertised model IDs")
     args = parser.parse_args()
     command = args.command
     if args.npm_prefix:
@@ -29,9 +30,14 @@ def main():
         with worker.rpc_lock:
             session = worker.new_session(args.timeout)
             model = acp.session_model(session)
-        print(json.dumps({"ok": True, "platform": sys.platform, "bridge_version": constants.VERSION,
+        report = {"ok": True, "platform": sys.platform, "bridge_version": constants.VERSION,
                           "command": client.command, "session_model": model,
-                          "inference_requested": False}, ensure_ascii=True, indent=2))
+                          "inference_requested": False}
+        if args.list_models:
+            models = [value for item in acp._config_candidates(session, "model") for value in acp.options(item)]
+            legacy = (session.get("models") or {}).get("availableModels") or []
+            report["models"] = list(dict.fromkeys(models + [m["modelId"] for m in legacy if m.get("modelId")]))
+        print(json.dumps(report, ensure_ascii=True, indent=2))
     finally:
         client.close()
 

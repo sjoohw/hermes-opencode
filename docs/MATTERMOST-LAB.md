@@ -16,7 +16,7 @@ auxiliary:
     model: opencode-default
 ```
 
-This routes images through OpenCode, and so through the chat model. The project intent in `intend.md` assigns vision to Gemma 4 instead. A deployment that follows the intent points `auxiliary.vision` at Gemma 4.
+This profile delegates model selection to OpenCode for both chat and image analysis. Select a model that accepts images in the OpenCode configuration used by the gateway.
 
 ## Image support and its revisions
 

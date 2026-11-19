@@ -12,7 +12,7 @@ hermes chat --provider hermes-opencode-acp --model opencode-default
 
 OpenCode uses the working directory passed to the client (otherwise the Hermes process working directory), its normal configuration and the process environment. Set `HERMES_OPENCODE_ACP_COMMAND` to the OpenCode CLI's absolute executable path if several installations are available. Hermes communicates with OpenCode over stdio. OpenCode manages its own model configuration and credentials.
 
-The bridge supports OpenCode 1.x and 2.x (checked with 1.19.6 and 2.0.32) without extra settings. It starts the CLI with `acp --pure --port 4885`. If initialization fails, it retries with `acp --pure` (normal port selection), then with `acp` for 2.x, which rejects `--pure` and `--port`. Only initialization is retried; no session or prompt exists yet. Hermes always communicates over stdio. To force specific arguments, set `HERMES_OPENCODE_ACP_ARGS`, for example `acp --pure`. It replaces the whole argument list and disables the retries.
+The bridge supports OpenCode 1.x and 2.x (checked with 1.19.6 and 2.0.32) without extra settings. It starts the CLI with `acp --pure --port 4885`. If initialization fails, it retries with `acp --pure` (normal port selection), then with `acp` for 2.x, which rejects `--pure` and `--port`. Within the Hermes process, later workers try the last successful arguments for that executable first. A changed executable or failed handshake triggers discovery again. Hermes always communicates over stdio. To force specific arguments, set `HERMES_OPENCODE_ACP_ARGS`, for example `acp --pure`. It replaces the whole argument list and disables the retries.
 
 ## Hermes-owned tools: the relay agent
 
@@ -34,6 +34,24 @@ All three are optional. Set them in the environment that starts Hermes, includin
 
 A Hermes process keeps the environment and plugin code it started with. After changing a variable or the installed plugin, restart the Hermes gateway (`hermes gateway restart --detach`).
 
+## Gateway at Windows sign-in
+
+Use the Mattermost profile for every command. Run `Get-Command opencode` under the Windows account that runs Hermes. If necessary, set `HERMES_OPENCODE_ACP_COMMAND` to the executable's absolute path in that profile. With the correct profile selected, stop its manually started gateway before installing sign-in startup.
+
+```powershell
+hermes -p <profile> gateway stop
+hermes -p <profile> gateway install
+hermes -p <profile> gateway status
+```
+
+After the next sign-in, check status for the same profile and confirm that a Mattermost DM receives exactly one reply. Hermes uses a Windows scheduled task or a Startup-folder fallback. To remove automatic startup, run `hermes -p <profile> gateway stop` followed by `hermes -p <profile> gateway uninstall`.
+
+## Diagnostics and token counts
+
+Set `HERMES_OPENCODE_ACP_DIAGNOSTICS=1` in the gateway environment to log recognized provider error names (`provider.quota` and `provider.auth`). Vendor messages, stderr and unknown error names are discarded. A reused session is recreated once only on the known missing-session response before any update. Quota and authentication errors return immediately. Cancellation sends an ACP notification to the active prompt and allows up to 250 ms for it to finish before stopping the worker.
+
+When the CLI supplies consistent usage, the bridge includes cached input in the prompt count and reasoning in the completion count. Missing or ambiguous counts stay unknown. If a tool response needs correction, Hermes receives the final call's counts for compaction. This omits the first call from the Hermes billing total. Diagnostic logs include the combined total when both calls report usage.
+
 ## Checking the Hermes profile
 
 `model.provider` must be the bridge, and no other setting in the profile may reach the chat model directly. Run the read-only checker with Hermes's Python:
@@ -46,7 +64,7 @@ It fails if the main provider is not the bridge or any value contains a forbidde
 
 ## Images and auxiliary vision
 
-In the Hermes profile used by your TUI or Mattermost gateway, keep the bridge as the chat provider and point `auxiliary.vision` at an image-capable model. Replace the two placeholders with your existing vision backend settings.
+Select an image-capable model in the OpenCode configuration used by the gateway or TUI. In the corresponding Hermes profile, route both chat and auxiliary vision through the installed OpenCode CLI. The current bridge uses the OpenCode session default for both.
 
 ```yaml
 model:
@@ -55,11 +73,11 @@ model:
 
 auxiliary:
   vision:
-    provider: "<vision-provider>"
-    model: "<vision-model-id>"
+    provider: hermes-opencode-acp
+    model: opencode-default
 ```
 
-In Hermes 0.23.2, omitting `agent.image_input_mode` uses its default, `auto`. An explicitly configured auxiliary vision backend takes precedence in this mode. If your profile already uses that backend, keep its configuration.
+In Hermes 0.23.2, omitting `agent.image_input_mode` uses its default, `auto`. An explicitly configured auxiliary vision backend takes precedence in this mode.
 
 For a Mattermost image attachment, Hermes sends the image to the vision model and passes its description and cached file path to the main model as text over ACP. If OpenCode reports image input (`promptCapabilities.image: true`) at initialization, the bridge forwards inline base64 images as ACP image blocks, for example when the bridge itself is the vision backend. Otherwise a request whose latest user message carries an image fails before any prompt is sent, so a text-only guess is never returned as an image analysis. Earlier images in the history become text markers. Keep the Hermes `vision_analyze` tool enabled so the main model can ask a more specific question about the original image on a later turn.
 
@@ -69,7 +87,7 @@ When Hermes offers `vision_analyze`, the bridge adds an index of attachment desc
 
 Hermes receives structured tool requests reconstructed from OpenCode's text replies and applies its normal tool validation and approval flow. The bridge declines ACP permission requests and client-side filesystem and terminal requests. Use the relay agent above so OpenCode has no native tools to run. The child CLI inherits environment variables available to Hermes, including credentials.
 
-If a reply contains a malformed or disallowed tool request, the bridge asks OpenCode once, in the same session, to resend it. If the second reply also fails, the turn fails. If OpenCode exits after a turn has produced output, the bridge does not resend the prompt, so that inference is never billed twice.
+If a reply contains a malformed or disallowed tool request, the bridge asks OpenCode once, in the same session, to resend it. If the second reply also fails, the turn fails. If OpenCode exits after a turn has produced output, the bridge does not resend that prompt.
 
 ## Verification
 
