@@ -49,10 +49,11 @@ def update(session_id, payload):
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": payload}})
 
 
-def record(session_id, prompt):
-    if EXTRA and SCENARIO in ("record", "missing-effort", "agent", "bad-tool-once"):
+def record(session_id, prompt, parts=()):
+    if EXTRA and SCENARIO in ("record", "missing-effort", "agent", "bad-tool-once", "image"):
         with open(EXTRA, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"sessionId": session_id, "prompt": prompt,
+                                     "images": [part["data"] for part in parts if part.get("type") == "image"],
                                      "values": dict(SESSIONS[session_id])}) + "\n")
 
 
@@ -63,7 +64,8 @@ for line in sys.stdin:
         if SCENARIO == "invalid-json":
             print("not-json", flush=True)
             continue
-        result = {"protocolVersion": 1, "agentCapabilities": {}}
+        caps = {"promptCapabilities": {"image": True}} if SCENARIO == "image" else {}
+        result = {"protocolVersion": 1, "agentCapabilities": caps}
     elif method == "session/new":
         COUNTER += 1
         session_id = "fake-session-" + str(COUNTER)
@@ -119,11 +121,11 @@ for line in sys.stdin:
                     assert reply["result"]["outcome"]["outcome"] == "cancelled"
                 else:
                     assert reply["error"]["code"] == -32601
-        record(session_id, prompt)
+        record(session_id, prompt, params["prompt"])
         text = "FAKE_ACP_OK"
         if SCENARIO == "pid":
             text = "PID:" + str(os.getpid())
-        if SCENARIO in ("record", "missing-effort", "agent"):
+        if SCENARIO in ("record", "missing-effort", "agent", "image"):
             text = "OK"
         if SCENARIO == "exit-once":
             text = "OK"

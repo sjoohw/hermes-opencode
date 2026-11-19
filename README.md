@@ -36,10 +36,10 @@ A Hermes process keeps the environment and plugin code it started with. After ch
 
 ## Checking the Hermes profile
 
-`model.provider` must be the bridge, and nothing else in the profile may call CodeLLM directly. Run the read-only checker with Hermes's Python:
+`model.provider` must be the bridge, and no other setting in the profile may reach the chat model directly. Run the read-only checker with Hermes's Python:
 
 ```sh
-python tools/check_hermes_config.py --forbid <direct CodeLLM host> --forbid <CodeLLM model name>
+python tools/check_hermes_config.py --forbid <direct model host> --forbid <model name>
 ```
 
 It fails if the main provider is not the bridge or any value contains a forbidden string. It warns about fallback chains and delegation providers outside the bridge, and lists each `auxiliary.*` provider. It prints key paths, not values.
@@ -61,9 +61,9 @@ auxiliary:
 
 In Hermes 0.23.2, omitting `agent.image_input_mode` uses its default, `auto`. An explicitly configured auxiliary vision backend takes precedence in this mode. If your profile already uses that backend, keep its configuration.
 
-For a Mattermost image attachment, Hermes sends the image to the vision model and passes its description and cached file path to the main model as text over ACP. The bridge forwards inline base64 images as ACP image blocks when it handles the vision request. Keep the Hermes `vision_analyze` tool enabled so the main model can ask a more specific question about the original image on a later turn.
+For a Mattermost image attachment, Hermes sends the image to the vision model and passes its description and cached file path to the main model as text over ACP. If OpenCode reports image input (`promptCapabilities.image: true`) at initialization, the bridge forwards inline base64 images as ACP image blocks, for example when the bridge itself is the vision backend. Otherwise a request whose latest user message carries an image fails before any prompt is sent, so a text-only guess is never returned as an image analysis. Earlier images in the history become text markers. Keep the Hermes `vision_analyze` tool enabled so the main model can ask a more specific question about the original image on a later turn.
 
-A Mattermost image follow-up flow was tested in a separate Windows profile using the image forwarding and attachment recall logic now included here. See [docs/MATTERMOST-LAB.md](docs/MATTERMOST-LAB.md).
+When Hermes offers `vision_analyze`, the bridge adds an index of attachment descriptions and paths from Hermes's image notes: the whole history for a new ACP session, new attachments only for a continued one. A Mattermost image follow-up flow was tested in a separate Windows profile before these behaviors were revised. See [docs/MATTERMOST-LAB.md](docs/MATTERMOST-LAB.md).
 
 ## Tools and permissions
 

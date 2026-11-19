@@ -6,7 +6,7 @@ Checked on 2026-11-19 on native Windows 11 with Python 3.13.5 and Hermes 0.23.2.
 
 ### Offline
 
-- `python -m unittest discover -s tests`: 99 tests passed.
+- `python -m unittest discover -s tests`: 113 tests passed.
 - `hermes plugins doctor`: manifest, import and registration of provider `hermes-opencode-acp` passed.
 
 ### Real OpenCode, both versions
@@ -29,8 +29,8 @@ The live check sends two prompts. The model requested the synthetic remote tool,
 ### Not verified
 
 - A full Hermes chat in the default profile. Its gateway was started before the plugin and environment changes and had live sessions, so it was not restarted.
-- The company OpenCode with CodeLLM. This PC used a personal OpenAI login.
-- Image forwarding. It exists only in a separate lab profile; see [MATTERMOST-LAB.md](MATTERMOST-LAB.md).
+- The company OpenCode deployment. This PC used a personal OpenAI login.
+- Image forwarding and attachment recall with a real model after their revision. The offline suite covers the capability check, note parsing, signatures and the sync/async contract. The Mattermost recheck is described in [MATTERMOST-LAB.md](MATTERMOST-LAB.md).
 
 ## Historical results from upstream
 

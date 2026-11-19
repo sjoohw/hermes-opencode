@@ -4,4 +4,6 @@ The selected OpenCode executable runs with the Hermes process environment and wo
 
 The bridge declines ACP requests for permission, filesystem access and terminal access. It converts text tool requests into Hermes tool calls for validation. Native actions already allowed by OpenCode follow the CLI's own permissions. Once OpenCode reports such an action as running or completed, the bridge fails the turn, but it cannot undo the action. Select the tool-less `hermes-relay` agent to prevent native actions.
 
+When OpenCode reports image input, inline images in the conversation are sent to OpenCode and its configured model. Attachment descriptions from Hermes are labelled as user content in prompts.
+
 Report suspected vulnerabilities privately to the maintainer of the deployed fork. Omit credentials, private prompts and internal logs.

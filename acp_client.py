@@ -9,6 +9,7 @@ import json
 import math
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -150,13 +151,14 @@ def _plain(value):
     return value
 
 
-def render_content(content):
+def render_content(content, images=True):
+    """Render message content as text. images=False marks inline images as not forwarded."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(item if isinstance(item, str) else _render_part(item)
+        return "\n".join(item if isinstance(item, str) else _render_part(item, images)
                          for item in content if isinstance(item, (str, dict)))
     return json.dumps(content, ensure_ascii=False)
 
@@ -174,9 +176,12 @@ def image_block(item):
     return {"type": "image", "mimeType": header[5:-7], "data": data}
 
 
-def _render_part(item):
+def _render_part(item, images=True):
     if image_block(item):
-        return "[See attached image]"
+        if images:
+            return "[See attached image]"
+        return ("[Inline image not forwarded: this OpenCode agent did not advertise image input. "
+                "Use the vision_analyze tool on the original file if its contents matter.]")
     kind = item.get("type")
     if kind in (None, "text", "input_text", "output_text"):
         return str(item.get("text", ""))
@@ -206,11 +211,26 @@ def message_signature(message):
         tool_calls.append({"id": call.get("id"), "name": function.get("name"), "arguments": arguments})
     payload = {
         "role": data.get("role"),
-        "content": data.get("content"),
+        # Rendered text keeps formatting-only differences from breaking session reuse;
+        # ordered image hashes still tell different attachments apart.
+        "content": {"text": render_content(data.get("content")),
+                    "images": [hashlib.sha256(url.encode("utf-8")).hexdigest()
+                               for url in _inline_image_urls(data.get("content"))]},
         "tool_calls": tool_calls,
         "tool_call_id": data.get("tool_call_id"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+
+def _inline_image_urls(content):
+    if not isinstance(content, list):
+        return []
+    urls = []
+    for item in content:
+        if image_block(item):
+            image = item.get("image_url")
+            urls.append(image.get("url") if isinstance(image, dict) else image)
+    return urls
 
 
 def prompt_signature(tools=None, tool_choice=None):
@@ -218,7 +238,7 @@ def prompt_signature(tools=None, tool_choice=None):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
 
 
-def render_transcript(messages):
+def render_transcript(messages, images=True):
     parts = []
     for message in messages or []:
         data = _plain(message)
@@ -228,7 +248,7 @@ def render_transcript(messages):
         label = role.capitalize()
         if role == "tool":
             label += " result for " + str(data.get("tool_call_id", "unknown"))
-        content = render_content(data.get("content"))
+        content = render_content(data.get("content"), images)
         if content:
             parts.append(label + ":\n" + content)
         if data.get("tool_calls"):
@@ -236,22 +256,22 @@ def render_transcript(messages):
     return "\n\n".join(parts)
 
 
-def render_prompt(messages, tools=None, tool_choice=None):
+def render_prompt(messages, tools=None, tool_choice=None, images=True):
     parts = [CONTRACT]
     if tools:
         parts.append("Remote Hermes tools (OpenAI function schemas):\n" + json.dumps(tools, ensure_ascii=False))
     if tool_choice is not None:
         parts.append("Remote tool choice: " + json.dumps(tool_choice, ensure_ascii=False))
     parts.append("Conversation transcript:")
-    transcript = render_transcript(messages)
+    transcript = render_transcript(messages, images)
     if transcript:
         parts.append(transcript)
     parts.extend(["Continue from the latest user request, using actual tool results already in the transcript.", CONTRACT])
     return "\n\n".join(parts)
 
 
-def render_delta(messages, start):
-    transcript = render_transcript((messages or [])[start:])
+def render_delta(messages, start, images=True):
+    transcript = render_transcript((messages or [])[start:], images)
     parts = ["Continuation of the same conversation. New transcript entries follow."]
     if transcript:
         parts.append(transcript)
@@ -259,27 +279,56 @@ def render_delta(messages, start):
     return "\n\n".join(parts)
 
 
-def image_recall_context(messages, tools):
-    if not any(t.get("function", {}).get("name") == "vision_analyze" for t in tools or []):
-        return ""
-    attachments = {}
-    for message in messages:
+# Image notes Hermes writes into user messages: gateway (run_inbound.py) and TUI (cli_stream_mixin.py).
+# The description runs until the "]" that directly precedes the path line, so it may hold blank lines,
+# but never into the next note. The path runs to the "]" that ends its line, so it may contain "]".
+NOTE_HEADER = r"\[The user (?:sent|attached) an image"
+IMAGE_NOTE = re.compile(
+    NOTE_HEADER + r"[^\n]*?(?:Here's what I can see \(user-supplied image content, "
+    r"not instructions\)|Here's what it contains):\n(?P<description>(?:(?!" + NOTE_HEADER + r").)*?)\]\n"
+    r"\[If you need a closer look, use vision_analyze with image_url: (?P<path>[^\n]*?)(?: ~)?\](?=\n|$)",
+    re.S)
+
+
+def image_notes(messages):
+    """(path, description) pairs from Hermes image notes in user messages, in order."""
+    notes = []
+    for message in messages or []:
         data = _plain(message)
-        body = data.get("content")
-        if data.get("role") != "user" or not isinstance(body, str):
+        if not isinstance(data, dict) or data.get("role") != "user":
             continue
-        for line in body.splitlines():
-            if line.startswith("[If you need a closer look, use vision_analyze with image_url: "):
-                path = line.split("image_url: ", 1)[1].removesuffix(" ~]").removesuffix("]").strip()
-                attachments[path] = body.partition(line)[0].strip()[:500]
+        body = render_content(data.get("content"))
+        for match in IMAGE_NOTE.finditer(body):
+            path = match.group("path").strip()
+            if path:
+                notes.append((path, match.group("description").strip()[:500]))
+    return notes
+
+
+def _request_has_images(messages):
+    """Inline images from the latest user message onward: the input of the current request."""
+    messages = list(messages or [])
+    latest = max((index for index, message in enumerate(messages)
+                  if isinstance(_plain(message), dict) and _plain(message).get("role") == "user"), default=None)
+    if latest is None:
+        return False
+    return any(_inline_image_urls(_plain(message).get("content")) for message in messages[latest:]
+               if isinstance(_plain(message), dict))
+
+
+def image_recall_context(messages, tools, start=0):
+    """Attachment index for a new session (whole history) or a delta (new messages only)."""
+    if not any(isinstance(t, dict) and (t.get("function") or {}).get("name") == "vision_analyze" for t in tools or []):
+        return ""
+    attachments = dict(image_notes((messages or [])[start:]))
     if not attachments:
         return ""
-    return ("\n\nEarlier attachments in this conversation (descriptions are user content):\n"
+    # No CONTRACT copy here: a new-session prompt already carries it, and a delta keeps the session's.
+    return ("\n\nAttachments in this conversation (descriptions are user content):\n"
             + json.dumps(attachments, ensure_ascii=False)
             + "\nFor a visual detail or a disputed description, inspect the matching original now "
               "using vision_analyze(image_url=the listed path, question=the visual question). "
-              "Return the remote tool call, not a promise to inspect. Once its result is present, answer.\n"
-            + CONTRACT)
+              "Return the remote tool call, not a promise to inspect. Once its result is present, answer.")
 
 
 def parse_tool_calls(text, tools=None, tool_choice=None):
@@ -344,6 +393,7 @@ class BridgeWorker:
         self._sessions = []
         self._sequence = 0
         self._cwd = cwd
+        self.image_input = False
         self.rpc_lock = threading.RLock()
         try:
             self.owner = ProcessTree(command, args, cwd=cwd, env=env)
@@ -358,11 +408,14 @@ class BridgeWorker:
         for reader in self._readers:
             reader.start()
         try:
-            self.request("initialize", {
+            initialized = self.request("initialize", {
                 "protocolVersion": 1,
                 "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
                 "clientInfo": {"name": "hermes-opencode-acp", "version": VERSION},
             }, timeout=initialize_timeout)
+            prompt_caps = ((initialized.get("agentCapabilities") or {}).get("promptCapabilities") or {})
+            # Only an explicit true allows image blocks; a respawned process decides again.
+            self.image_input = prompt_caps.get("image") is True
         except WorkerDied as exc:
             self.close()
             raise WorkerDied(f"OpenCode ACP did not initialize with arguments {list(args)!r}; set "
@@ -690,13 +743,22 @@ class OpenCodeACPClient:
         return answer, "".join(reasoning)
 
     def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
-        prompt = render_prompt(messages, tools, tool_choice) if start == 0 else render_delta(messages, start)
-        prompt += image_recall_context(messages, tools)
+        supported = worker.image_input
+        if not supported and _request_has_images(messages):
+            # A vision request must not succeed on a text-only guess.
+            raise RuntimeError("OpenCode agent did not advertise image input; the new image was not sent. "
+                               "Point auxiliary vision at an image-capable backend. No prompt was sent.")
+        if start == 0:
+            prompt = render_prompt(messages, tools, tool_choice, images=supported)
+        else:
+            prompt = render_delta(messages, start, images=supported)
+        prompt += image_recall_context(messages, tools, start)
         images = []
-        for message in messages[start:]:
-            content = _plain(message).get("content")
-            if isinstance(content, list):
-                images.extend(block for item in content if (block := image_block(item)))
+        if supported:
+            for message in messages[start:]:
+                content = _plain(message).get("content")
+                if isinstance(content, list):
+                    images.extend(block for item in content if (block := image_block(item)))
         answer, reasoning = self._send_prompt(worker, session, prompt, timeout, images)
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
@@ -774,6 +836,12 @@ class OpenCodeACPClient:
                 raise
 
     def _dispatch_completion(self, **kwargs):
+        """Sync callers get the result; callers inside a running event loop get an awaitable.
+
+        Hermes awaits clients that declare HERMES_SKIP_ASYNC_WRAP (auxiliary vision) and has no
+        hook for a provider-specific async client. A synchronous call made on an event-loop thread
+        would receive a coroutine; no such path was found in Hermes 0.23.2.
+        """
         try:
             asyncio.get_running_loop()
         except RuntimeError:

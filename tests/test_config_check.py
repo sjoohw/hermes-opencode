@@ -30,8 +30,8 @@ class ConfigCheckTests(unittest.TestCase):
         self.assertIn("fallback_providers[0]", warnings[0])
 
     def test_forbidden_value_is_reported_by_path_without_the_value(self):
-        config = dict(GOOD, providers={"corp": {"base_url": "https://CodeLLM.corp.example/v1", "api_key": "SECRET"}})
-        errors, _, _ = checker.check(config, ["codellm.corp.example"])
+        config = dict(GOOD, providers={"corp": {"base_url": "https://LLM.corp.example/v1", "api_key": "SECRET"}})
+        errors, _, _ = checker.check(config, ["llm.corp.example"])
         self.assertEqual(errors, ["providers.corp.base_url references a forbidden endpoint or model (value not shown)"])
         self.assertNotIn("SECRET", " ".join(errors))
 

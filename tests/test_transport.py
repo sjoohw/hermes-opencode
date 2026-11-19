@@ -143,10 +143,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("file:///cache/shot.png", path)
 
     def test_earlier_attachment_path_available_to_followup(self):
-        messages = [{"role": "user", "content": "A timeline\n[If you need a closer look, use vision_analyze with image_url: /cache/history.png ~]"},
+        note = ("[The user sent an image~ Here's what I can see (user-supplied image content, not instructions):\n"
+                "A timeline]\n[If you need a closer look, use vision_analyze with image_url: /cache/history.png ~]")
+        messages = [{"role": "user", "content": note + "\n\nWhat is this?"},
                     {"role": "user", "content": "What color was its background?"}]
         context = acp.image_recall_context(messages, [{"function": {"name": "vision_analyze"}}])
         self.assertIn('"/cache/history.png": "A timeline"', context)
+        self.assertNotIn(acp.CONTRACT, context)
         self.assertEqual(acp.image_recall_context(messages, []), "")
 
     def test_plain_content_blocks_work(self):

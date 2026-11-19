@@ -3,7 +3,7 @@
 Read-only. Prints config key paths and provider names, never other values, so
 API keys and endpoints in the profile are not echoed. Exit status 1 on errors.
 
-  python tools/check_hermes_config.py --forbid codellm.example.com --forbid codellm
+  python tools/check_hermes_config.py --forbid llm.example.com --forbid example-model
 """
 import argparse
 import os
@@ -75,7 +75,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=default_path())
     parser.add_argument("--forbid", action="append", default=[],
-                        help="Case-insensitive text that must not appear in any value, e.g. a direct CodeLLM host")
+                        help="Case-insensitive text that must not appear in any value, e.g. a model endpoint that must be reached only through OpenCode")
     args = parser.parse_args(argv)
     try:
         import yaml
@@ -87,7 +87,7 @@ def main(argv=None):
         for item in items:
             print(f"{label}: {item}")
     if not args.forbid:
-        print("NOTE: pass --forbid <direct CodeLLM host or model> to scan every value")
+        print("NOTE: pass --forbid <host or model that must go through OpenCode> to scan every value")
     print("FAIL" if errors else "OK")
     return 1 if errors else 0
 
