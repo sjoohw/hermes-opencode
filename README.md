@@ -81,7 +81,7 @@ In Hermes 0.23.2, omitting `agent.image_input_mode` uses its default, `auto`. An
 
 For a Mattermost image attachment, Hermes sends the image to the vision model and passes its description and cached file path to the main model as text over ACP. If OpenCode reports image input (`promptCapabilities.image: true`) at initialization, the bridge forwards inline base64 images as ACP image blocks, for example when the bridge itself is the vision backend. Otherwise a request whose latest user message carries an image fails before any prompt is sent, so a text-only guess is never returned as an image analysis. Earlier images in the history become text markers. Keep the Hermes `vision_analyze` tool enabled so the main model can ask a more specific question about the original image on a later turn.
 
-When Hermes offers `vision_analyze`, the bridge adds an index of attachment descriptions and paths from Hermes's image notes: the whole history for a new ACP session, new attachments only for a continued one. A Mattermost image follow-up flow was tested in a separate Windows profile before these behaviors were revised. See [docs/MATTERMOST-LAB.md](docs/MATTERMOST-LAB.md).
+When Hermes offers `vision_analyze`, the bridge adds an index of attachment descriptions and paths from Hermes's image notes: the whole history for a new ACP session, new attachments only for a continued one.
 
 ## Tools and permissions
 
@@ -93,4 +93,4 @@ If a reply contains a malformed or disallowed tool request, the bridge asks Open
 
 Run `python -m unittest discover -s tests` for offline transport tests. They need neither Hermes nor OpenCode. Run `python tests/smoke_cli.py --command /path/to/opencode` for a real ACP session handshake with no chat prompt. Run `python tests/e2e_tool_roundtrip.py --command /path/to/opencode` for a live check that sends two prompts through OpenCode: one tool request, then an answer that must use the tool's result. A reported model of `opencode-default` means the server omitted model metadata.
 
-This fork builds on [engida32/hermes-opencode-acp](https://github.com/engida32/hermes-opencode-acp) and [cryptobredda/hermes-opencode-free-acp](https://github.com/cryptobredda/hermes-opencode-free-acp). See [LICENSE](LICENSE) for attribution. [docs/VERIFICATION.md](docs/VERIFICATION.md) records this fork's results and the upstream history.
+This fork builds on [engida32/hermes-opencode-acp](https://github.com/engida32/hermes-opencode-acp) and [cryptobredda/hermes-opencode-free-acp](https://github.com/cryptobredda/hermes-opencode-free-acp). See [LICENSE](LICENSE) for attribution. [docs/VERIFICATION.md](docs/VERIFICATION.md) records this fork's verification results.
