@@ -82,6 +82,14 @@ class IsolationAndSignatureTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in start.call_args_list],
                              [["acp", "--pure", "--port", "4885"], ["acp", "--pure"]])
 
+    def test_cli_without_pure_falls_back_to_plain_acp(self):
+        item = acp.OpenCodeACPClient()
+        self.addCleanup(item.close)
+        with patch.object(acp, "BridgeWorker") as start:
+            start.side_effect = [acp.WorkerDied("no port"), acp.WorkerDied("no --pure"), start.return_value]
+            item._ensure_worker(2)
+            self.assertEqual(start.call_args_list[-1].args[1], ["acp"])
+
     def test_default_command_line_is_pure(self):
         item = acp.OpenCodeACPClient()
         self.addCleanup(item.close)

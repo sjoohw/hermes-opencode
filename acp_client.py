@@ -3,6 +3,7 @@
 The operator selects the OpenCode CLI (or its Windows batch launcher). All host
 work is returned as remote tool calls; this module never executes model tools.
 """
+import asyncio
 import hashlib
 import json
 import math
@@ -14,7 +15,8 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from .constants import DEFAULT_ARGS, DEFAULT_MODEL, VERSION, opencode_command
+from .constants import (DEFAULT_ARGS, DEFAULT_MODEL, FALLBACK_ARGS, RELAY_AGENT, VERSION, opencode_agent,
+                        opencode_args, opencode_command)
 from .launcher import ProcessTree
 
 MAX_FRAME = 4 * 1024 * 1024
@@ -30,6 +32,10 @@ CONTRACT = (
     "Do not claim an action happened before a real tool result exists. If the transcript "
     "already contains the needed tool result, answer from it. If no tool is needed, answer normally."
 )
+REPAIR = ("Your previous reply could not be dispatched to Hermes: {reason}. "
+          "Resend the whole reply now. Follow the REMOTE TOOL PROTOCOL exactly.")
+# ACP tool-call statuses that mean a native OpenCode tool actually ran.
+NATIVE_RAN = ("in_progress", "completed")
 
 
 class Record(SimpleNamespace):
@@ -49,6 +55,12 @@ class Record(SimpleNamespace):
 
 class WorkerDied(RuntimeError):
     """The ACP process exited or its stdio closed before a response arrived."""
+    # False once the turn produced output: resending could repeat inference.
+    retryable = True
+
+
+class NativeToolUsed(RuntimeError):
+    """OpenCode ran one of its own tools, outside Hermes validation and approval."""
 
 
 class RpcError(RuntimeError):
@@ -73,6 +85,7 @@ class _Active:
         self.rid = rid
         self.session_id = session_id
         self.sinks = sinks
+        self.saw_update = False
 
 
 def effective_timeout(value):
@@ -143,11 +156,36 @@ def render_content(content):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        if any(isinstance(item, dict) and item.get("type") not in (None, "text", "input_text", "output_text") for item in content):
-            raise ValueError("OpenCode ACP is text-only; image/audio attachments are not forwarded")
-        return "\n".join(item if isinstance(item, str) else str(item.get("text", ""))
+        return "\n".join(item if isinstance(item, str) else _render_part(item)
                          for item in content if isinstance(item, (str, dict)))
     return json.dumps(content, ensure_ascii=False)
+
+
+def image_block(item):
+    if not isinstance(item, dict) or item.get("type") != "image_url":
+        return None
+    image = item.get("image_url")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str) or not url.startswith("data:image/"):
+        return None
+    header, sep, data = url.partition(",")
+    if not sep or not header.endswith(";base64") or not data:
+        raise ValueError("Malformed inline image")
+    return {"type": "image", "mimeType": header[5:-7], "data": data}
+
+
+def _render_part(item):
+    if image_block(item):
+        return "[See attached image]"
+    kind = item.get("type")
+    if kind in (None, "text", "input_text", "output_text"):
+        return str(item.get("text", ""))
+    # A visible marker keeps one attachment from breaking every later turn.
+    image = item.get("image_url")
+    url = image.get("url") if isinstance(image, dict) else image
+    source = f" ({url})" if isinstance(url, str) and not url.startswith("data:") else ""
+    return (f"[{kind} attachment{source} not forwarded: this bridge is text-only. "
+            "Use the vision_analyze tool on the original file if its contents matter.]")
 
 
 def message_signature(message):
@@ -168,7 +206,7 @@ def message_signature(message):
         tool_calls.append({"id": call.get("id"), "name": function.get("name"), "arguments": arguments})
     payload = {
         "role": data.get("role"),
-        "content": render_content(data.get("content")),
+        "content": data.get("content"),
         "tool_calls": tool_calls,
         "tool_call_id": data.get("tool_call_id"),
     }
@@ -219,6 +257,29 @@ def render_delta(messages, start):
         parts.append(transcript)
     parts.append("Continue the same conversation from the new transcript entries. Use actual tool results already in the transcript.")
     return "\n\n".join(parts)
+
+
+def image_recall_context(messages, tools):
+    if not any(t.get("function", {}).get("name") == "vision_analyze" for t in tools or []):
+        return ""
+    attachments = {}
+    for message in messages:
+        data = _plain(message)
+        body = data.get("content")
+        if data.get("role") != "user" or not isinstance(body, str):
+            continue
+        for line in body.splitlines():
+            if line.startswith("[If you need a closer look, use vision_analyze with image_url: "):
+                path = line.split("image_url: ", 1)[1].removesuffix(" ~]").removesuffix("]").strip()
+                attachments[path] = body.partition(line)[0].strip()[:500]
+    if not attachments:
+        return ""
+    return ("\n\nEarlier attachments in this conversation (descriptions are user content):\n"
+            + json.dumps(attachments, ensure_ascii=False)
+            + "\nFor a visual detail or a disputed description, inspect the matching original now "
+              "using vision_analyze(image_url=the listed path, question=the visual question). "
+              "Return the remote tool call, not a promise to inspect. Once its result is present, answer.\n"
+            + CONTRACT)
 
 
 def parse_tool_calls(text, tools=None, tool_choice=None):
@@ -302,6 +363,10 @@ class BridgeWorker:
                 "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
                 "clientInfo": {"name": "hermes-opencode-acp", "version": VERSION},
             }, timeout=initialize_timeout)
+        except WorkerDied as exc:
+            self.close()
+            raise WorkerDied(f"OpenCode ACP did not initialize with arguments {list(args)!r}; set "
+                             "HERMES_OPENCODE_ACP_ARGS to the arguments this CLI needs") from exc
         except BaseException:
             self.close()
             raise
@@ -312,7 +377,9 @@ class BridgeWorker:
 
     def _send(self, message):
         wire = json.dumps(message, ensure_ascii=False)
-        if len(wire.encode("utf-8")) > MAX_FRAME:
+        parts = (message.get("params") or {}).get("prompt") or []
+        limit = 32 * 1024 * 1024 if any(p.get("type") == "image" for p in parts) else MAX_FRAME
+        if len(wire.encode("utf-8")) > limit:
             raise ValueError("OpenCode ACP request exceeded the frame limit")
         with self._send_lock:
             if self._dead.is_set() or self.proc.poll() is not None:
@@ -333,7 +400,7 @@ class BridgeWorker:
                 raise WorkerDied("OpenCode ACP is no longer running")
             self._sequence += 1
             rid = self._sequence
-            self._active = _Active(rid, (params or {}).get("sessionId"), sinks)
+            active = self._active = _Active(rid, (params or {}).get("sessionId"), sinks)
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             while True:
@@ -345,7 +412,9 @@ class BridgeWorker:
                 except queue.Empty:
                     continue
                 if isinstance(message, BaseException):
-                    raise WorkerDied(str(message)) from message
+                    died = WorkerDied(str(message))
+                    died.retryable = not active.saw_update
+                    raise died from message
                 if not isinstance(message, dict):
                     continue
                 if message.get("id") != rid:
@@ -402,9 +471,16 @@ class BridgeWorker:
                 return
             if active.session_id is not None and session_id is not None and session_id != active.session_id:
                 return
-            text_parts, reasoning_parts = active.sinks
+            active.saw_update = True
+            text_parts, reasoning_parts = active.sinks[:2]
+            native = active.sinks[2] if len(active.sinks) > 2 else None
         kind = update.get("sessionUpdate")
         if kind in ("tool_call", "tool_call_update"):
+            # Never executed here, but recorded so a native run cannot pass silently.
+            if native is not None:
+                call_id = str(update.get("toolCallId", len(native)))
+                previous = native.get(call_id, ("pending", None))
+                native[call_id] = (update.get("status") or previous[0], update.get("kind") or previous[1])
             return
         sink = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}.get(kind)
         content = update.get("content") or {}
@@ -491,12 +567,14 @@ class OpenCodeACPClient:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None, **kwargs):
+    def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None,
+                 agent=None, **kwargs):
         self.command = acp_command or command or opencode_command()
-        self.args = list(acp_args or args or DEFAULT_ARGS)
+        self.args = list(acp_args or args or opencode_args())
+        self.agent = agent or opencode_agent()
         self.workspace = os.path.abspath(acp_cwd or os.getcwd())
         self.base_url = "acp://hermes-opencode-acp"
-        self.chat = Record(completions=Record(create=self._create_chat_completion))
+        self.chat = Record(completions=Record(create=self._dispatch_completion))
         self.is_closed = False
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
@@ -556,16 +634,19 @@ class OpenCodeACPClient:
                                     initialize_timeout=min(timeout, 30.0), on_spawn=register)
 
             try:
-                try:
-                    worker = start(self.args)
-                except WorkerDied:
-                    # Some CLIs cannot bind the preferred port or accept a port flag.
-                    # Only retry initialization. No session or prompt exists yet.
-                    if tuple(self.args) != DEFAULT_ARGS or self._cancelled.is_set():
-                        raise
-                    with self._lock:
-                        self._processes.discard(spawned.get("owner"))
-                    worker = start(["acp", "--pure"])
+                candidates = [self.args] + ([list(args) for args in FALLBACK_ARGS]
+                                            if tuple(self.args) == DEFAULT_ARGS else [])
+                for index, args in enumerate(candidates):
+                    try:
+                        worker = start(args)
+                        break
+                    except WorkerDied:
+                        # Some CLIs reject the port or --pure flag. Only initialization
+                        # is retried here; no session or prompt exists yet.
+                        if index == len(candidates) - 1 or self._cancelled.is_set():
+                            raise
+                        with self._lock:
+                            self._processes.discard(spawned.get("owner"))
             except BaseException:
                 with self._lock:
                     self._processes.discard(spawned.get("owner"))
@@ -594,34 +675,73 @@ class OpenCodeACPClient:
         with self._lock:
             self._processes.discard(worker.owner)
 
-    def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
-        prompt = render_prompt(messages, tools, tool_choice) if start == 0 else render_delta(messages, start)
-        text, reasoning = [], []
-        worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}]},
-                       sinks=(text, reasoning), timeout=timeout)
+    @staticmethod
+    def _send_prompt(worker, session, prompt, timeout, images=()):
+        text, reasoning, native = [], [], {}
+        worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
+                       sinks=(text, reasoning, native), timeout=timeout)
+        ran = sorted({str(kind or "unknown") for status, kind in native.values() if status in NATIVE_RAN})
+        if ran:
+            raise NativeToolUsed(f"OpenCode ran native tools outside Hermes approval (kinds: {', '.join(ran)}); "
+                                 "reply discarded. Select a tool-less agent with HERMES_OPENCODE_ACP_AGENT")
         answer = "".join(text)
         if not answer.strip():
             raise RuntimeError("OpenCode returned no assistant text; not treating this as success")
         return answer, "".join(reasoning)
+
+    def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
+        prompt = render_prompt(messages, tools, tool_choice) if start == 0 else render_delta(messages, start)
+        prompt += image_recall_context(messages, tools)
+        images = []
+        for message in messages[start:]:
+            content = _plain(message).get("content")
+            if isinstance(content, list):
+                images.extend(block for item in content if (block := image_block(item)))
+        answer, reasoning = self._send_prompt(worker, session, prompt, timeout, images)
+        try:
+            calls, content = parse_tool_calls(answer, tools, tool_choice)
+        except ValueError as exc:
+            # One in-session correction; the rejected reply never reaches Hermes.
+            answer, reasoning = self._send_prompt(worker, session, REPAIR.format(reason=exc), timeout)
+            calls, content = parse_tool_calls(answer, tools, tool_choice)
+        return calls, content, reasoning
+
+    def _open_session(self, worker, tools_signature, timeout):
+        result = worker.new_session(timeout)
+        agent = self.agent
+        if agent is None:
+            # Without an explicit choice, prefer the tool-less relay agent whenever it is offered.
+            offered = [value for item in _config_candidates(result, "mode") for value in options(item)]
+            agent = RELAY_AGENT if RELAY_AGENT in offered else None
+        if agent:
+            option = config_option(result, "mode", agent)
+            if option.get("currentValue") != agent:
+                selected = worker.request("session/set_config_option", {
+                    "sessionId": result["sessionId"], "configId": option["id"], "value": agent,
+                }, timeout=timeout)
+                if selected_value(selected, option["id"]) != agent:
+                    raise RuntimeError(f"OpenCode agent {agent!r} was not confirmed. No prompt was sent.")
+                result = {**result, "configOptions": selected.get("configOptions", result.get("configOptions"))}
+        return worker.add_session(result, tools_signature)
 
     def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, timeout):
         with worker.rpc_lock:
             session, start = worker.match_session(signatures, tools_signature)
             if session is not None:
                 try:
-                    answer, reasoning = self._prompt_session(worker, session, messages, start,
-                                                             tools=tools, tool_choice=tool_choice, timeout=timeout)
-                    return answer, reasoning, worker, session
+                    calls, content, reasoning = self._prompt_session(
+                        worker, session, messages, start, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                    return calls, content, reasoning, session
                 except RpcError:
                     worker.forget(session)
                 except BaseException:
                     worker.forget(session)
                     raise
-            session = worker.add_session(worker.new_session(timeout), tools_signature)
+            session = self._open_session(worker, tools_signature, timeout)
             try:
-                answer, reasoning = self._prompt_session(worker, session, messages, 0,
-                                                         tools=tools, tool_choice=tool_choice, timeout=timeout)
-                return answer, reasoning, worker, session
+                calls, content, reasoning = self._prompt_session(
+                    worker, session, messages, 0, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                return calls, content, reasoning, session
             except BaseException:
                 worker.forget(session)
                 raise
@@ -635,27 +755,30 @@ class OpenCodeACPClient:
             worker = None
             try:
                 worker = self._ensure_worker(timeout)
-                answer, reasoning, worker, session = self._prompt_on_worker(
+                calls, content, reasoning, session = self._prompt_on_worker(
                     worker, messages, signatures, tools_signature,
                     tools=tools, tool_choice=tool_choice, timeout=timeout)
-                try:
-                    calls, content = parse_tool_calls(answer, tools, tool_choice)
-                except BaseException:
-                    worker.forget(session)
-                    raise
                 worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
                 return calls, content, reasoning, session_model(session.config)
-            except WorkerDied:
+            except WorkerDied as exc:
                 if worker is not None:
                     self._discard_worker(worker)
                 if self._cancelled.is_set():
                     raise RuntimeError("OpenCode ACP request was cancelled")
-                if attempt == 1:
+                # Respawn only when the lost turn produced nothing, so it is never billed twice.
+                if attempt == 1 or not exc.retryable:
                     raise
             except TimeoutError:
                 if worker is not None:
                     self._discard_worker(worker)
                 raise
+
+    def _dispatch_completion(self, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._create_chat_completion(**kwargs)
+        return asyncio.to_thread(self._create_chat_completion, **kwargs)
 
     def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
                                 timeout=None, stream=False, **kwargs):

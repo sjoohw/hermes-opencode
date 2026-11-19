@@ -1,0 +1,19 @@
+// Merge "agent" into the global OpenCode config (folder: `opencode debug paths`).
+// This V1 format works on OpenCode 1.x and 2.x: 2.x converts it ("prompt" ->
+// "system", "permission" -> deny-all "permissions"). Do not add the 2.x-only
+// "agents"/"permissions" keys: OpenCode 1.x rejects the whole file if they appear.
+// Verified with OpenCode 1.19.6 and 2.0.32. The bridge selects this agent
+// automatically when OpenCode offers it.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "hermes-relay": {
+      "description": "Text-only model relay for Hermes. Hermes owns tools and approvals.",
+      "mode": "primary",
+      // Replaces OpenCode's coding-agent prompt and native tool instructions.
+      "prompt": "You are the language model behind Hermes. Reply in text only. Hermes describes its tools and executes them.",
+      // Denies every native tool for this agent only.
+      "permission": { "*": "deny" }
+    }
+  }
+}

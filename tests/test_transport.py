@@ -131,9 +131,23 @@ class ProtocolTests(unittest.TestCase):
                 self.assertIn("delegate_task", prompt)
                 self.assertIn("prior remote tool requests", prompt)
 
-    def test_image_attachments_fail_instead_of_disappearing(self):
-        with self.assertRaises(ValueError):
-            acp.render_content([{"type": "image_url", "image_url": {"url": "data:image/png;base64,TEST"}}])
+    def test_image_attachments_become_visible_markers(self):
+        text = acp.render_content([{"type": "text", "text": "look"},
+                                   {"type": "image_url", "image_url": {"url": "data:image/png;base64,TEST"}}])
+        self.assertIn("look", text)
+        self.assertIn("[See attached image]", text)
+        self.assertEqual(acp.image_block({"type": "image_url", "image_url": "data:image/png;base64,TEST"}),
+                         {"type": "image", "mimeType": "image/png", "data": "TEST"})
+        self.assertNotIn("base64", text)
+        path = acp.render_content([{"type": "image_url", "image_url": {"url": "file:///cache/shot.png"}}])
+        self.assertIn("file:///cache/shot.png", path)
+
+    def test_earlier_attachment_path_available_to_followup(self):
+        messages = [{"role": "user", "content": "A timeline\n[If you need a closer look, use vision_analyze with image_url: /cache/history.png ~]"},
+                    {"role": "user", "content": "What color was its background?"}]
+        context = acp.image_recall_context(messages, [{"function": {"name": "vision_analyze"}}])
+        self.assertIn('"/cache/history.png": "A timeline"', context)
+        self.assertEqual(acp.image_recall_context(messages, []), "")
 
     def test_plain_content_blocks_work(self):
         self.assertEqual(acp.render_content([{"type": "text", "text": "hello"}]), "hello")

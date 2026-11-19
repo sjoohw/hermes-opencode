@@ -2,10 +2,35 @@
 
 ## Hermes OpenCode bridge
 
-- Native Windows: 84 offline tests passed. Hermes 0.23.2 plugin validation and doctor both registered the provider.
-- OpenCode 1.19.6: two simultaneous bridge clients completed ACP initialization and session creation. The first listener was observed on 127.0.0.1:4885.
-- The local OpenCode 2.0.32 CLI did not complete the required ACP handshake with `--pure`. Check the target executable with the smoke test.
-- The checks above did not send an inference request. A live model-driven Hermes tool round trip is still unverified for this fork.
+Checked on 2026-11-19 on native Windows 11 with Python 3.13.5 and Hermes 0.23.2. OpenCode 1.19.6 was the global install. OpenCode 2.0.32 was installed separately with `npm install --prefix`. Both used the OpenCode-selected model `openai/gpt-6-luna`.
+
+### Offline
+
+- `python -m unittest discover -s tests`: 99 tests passed.
+- `hermes plugins doctor`: manifest, import and registration of provider `hermes-opencode-acp` passed.
+
+### Real OpenCode, both versions
+
+| Check | 1.19.6 | 2.0.32 |
+|---|---|---|
+| Startup with no bridge variables | Started with `acp --pure`. Port 4885 was already in use, so the first attempt failed. | Started with `acp` after `--port` and `--pure` were rejected |
+| `hermes-relay` from the V1 config | Offered and selected automatically | Converted to the 2.x form, offered and selected automatically |
+| Relay permissions | Final rule `* * deny` | Final rule `* * deny` |
+| `tests/e2e_tool_roundtrip.py` | Passed | Passed |
+
+The live check sends two prompts. The model requested the synthetic remote tool, then answered with the code from the supplied tool result. No tool ran on the host.
+
+### Configuration findings
+
+- OpenCode 1.19.6 rejects the whole config when the 2.x-only `agents`/`permissions` keys are present. OpenCode 2.0.32 accepts the V1 `agent`/`prompt`/`permission` keys and converts them. `opencode/hermes-relay.jsonc` therefore uses V1 keys.
+- On 2.0.32, a one-line prompt cost 14,559 input tokens with the built-in `build` agent and 234 with `hermes-relay`.
+- The OpenCode free model `opencode/tidepool-alpha-free` returned `provider.quota` for every custom or modified agent, while unmodified built-in agents succeeded in the same minute. Use a model that accepts custom agents.
+
+### Not verified
+
+- A full Hermes chat in the default profile. Its gateway was started before the plugin and environment changes and had live sessions, so it was not restarted.
+- The company OpenCode with CodeLLM. This PC used a personal OpenAI login.
+- Image forwarding. It exists only in a separate lab profile; see [MATTERMOST-LAB.md](MATTERMOST-LAB.md).
 
 ## Historical results from upstream
 

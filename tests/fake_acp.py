@@ -14,6 +14,8 @@ SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "normal"
 EXTRA = sys.argv[2] if len(sys.argv) > 2 else None
 SESSIONS = {}
 COUNTER = 0
+PROMPTS = 0
+AGENT = "hermes-relay"
 child = None
 if SCENARIO == "descendant":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
@@ -31,7 +33,8 @@ def config(session_id):
     values = SESSIONS[session_id]
     result = [
         {"id": "mode", "category": "mode", "currentValue": values["mode"],
-         "options": [{"value": "plan"}] + ([] if SCENARIO == "missing-build" else [{"value": "build"}])},
+         "options": [{"value": "plan"}] + ([] if SCENARIO == "missing-build" else [{"value": "build"}])
+         + ([{"value": AGENT}] if SCENARIO == "agent" else [])},
         {"id": "model", "category": "model", "currentValue": values["model"],
          "options": [{"value": model} for model in ("example/default-model", "example/other-model")]},
     ]
@@ -42,8 +45,12 @@ def config(session_id):
     return result
 
 
+def update(session_id, payload):
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": payload}})
+
+
 def record(session_id, prompt):
-    if EXTRA and SCENARIO in ("record", "missing-effort"):
+    if EXTRA and SCENARIO in ("record", "missing-effort", "agent", "bad-tool-once"):
         with open(EXTRA, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"sessionId": session_id, "prompt": prompt,
                                      "values": dict(SESSIONS[session_id])}) + "\n")
@@ -66,11 +73,17 @@ for line in sys.stdin:
         SESSIONS[session_id] = values
         result = {"sessionId": session_id, "configOptions": config(session_id)}
     elif method == "session/set_config_option":
-        raise AssertionError("Bridge changed OpenCode session settings")
+        params = request["params"]
+        # Only operator-selected agents may change; models stay with OpenCode.
+        if params["configId"] != "mode" or SCENARIO != "agent":
+            raise AssertionError("Bridge changed OpenCode session settings")
+        SESSIONS[params["sessionId"]]["mode"] = params["value"]
+        result = {"configOptions": config(params["sessionId"])}
     elif method == "session/prompt":
         params = request["params"]
         session_id = params["sessionId"]
         prompt = params["prompt"][0]["text"]
+        PROMPTS += 1
         if SCENARIO == "exit-once" and EXTRA and not os.path.exists(EXTRA):
             with open(EXTRA, "w", encoding="utf-8") as handle:
                 handle.write("used\n")
@@ -87,6 +100,17 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": "server-native", "method": "session/request_permission", "params": {}})
             reply = json.loads(sys.stdin.readline())
             assert reply["result"]["outcome"]["outcome"] == "cancelled"
+        if SCENARIO == "native-ran":
+            update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "n1", "kind": "execute", "status": "in_progress"})
+            update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "n1", "status": "completed"})
+        if SCENARIO == "native-refused":
+            update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "n1", "kind": "edit"})
+            update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "n1", "status": "failed"})
+        if SCENARIO == "exit-after-output" and EXTRA:
+            with open(EXTRA, "a", encoding="utf-8") as handle:
+                handle.write("prompt\n")
+            update(session_id, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "partial"}})
+            sys.exit(3)
         if SCENARIO == "denied-requests":
             for index, operation in enumerate(("session/request_permission", "fs/read_text_file", "fs/write_text_file", "terminal/create")):
                 send({"jsonrpc": "2.0", "id": "server-" + str(index), "method": operation, "params": {}})
@@ -99,7 +123,7 @@ for line in sys.stdin:
         text = "FAKE_ACP_OK"
         if SCENARIO == "pid":
             text = "PID:" + str(os.getpid())
-        if SCENARIO in ("record", "missing-effort"):
+        if SCENARIO in ("record", "missing-effort", "agent"):
             text = "OK"
         if SCENARIO == "exit-once":
             text = "OK"
@@ -108,6 +132,10 @@ for line in sys.stdin:
         if SCENARIO == "unicode":
             text = "ACP café — 雪 👋"
             assert text in prompt
+        if SCENARIO in ("bad-tool-once", "bad-tool-always"):
+            text = '<hermes_tool_call>{"id":"c1","type":"function","function":{"name":"check_connection","arguments":"{}"}}'
+            if SCENARIO == "bad-tool-once" and PROMPTS > 1:
+                text += "</hermes_tool_call>"
         if SCENARIO == "empty":
             text = ""
         if SCENARIO == "tool":
