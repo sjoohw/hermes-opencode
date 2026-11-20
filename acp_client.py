@@ -3,6 +3,7 @@
 The operator selects the OpenCode CLI (or its Windows batch launcher). All host
 work is returned as remote tool calls; this module never executes model tools.
 """
+from contextlib import contextmanager
 import asyncio
 import hashlib
 import json
@@ -118,6 +119,7 @@ class _Active:
         self.rid = rid
         self.session_id = session_id
         self.sinks = sinks
+        self.started = time.monotonic()
         self.saw_update = False
         self.finished = threading.Event()
 
@@ -131,6 +133,26 @@ def effective_timeout(value):
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("ACP timeout must be a finite positive number of seconds")
     return seconds
+
+
+def seconds_left(deadline):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError("OpenCode ACP request deadline expired")
+    return seconds
+
+
+@contextmanager
+def acquire_until(lock, deadline, stage):
+    started = time.monotonic()
+    if not lock.acquire(timeout=seconds_left(deadline)):
+        raise TimeoutError(f"OpenCode ACP timed out waiting for {stage}")
+    try:
+        if diagnostics_enabled():
+            _log.info("ACP %s queue wait %.3fs", stage, time.monotonic() - started)
+        yield
+    finally:
+        lock.release()
 
 
 def options(option):
@@ -488,7 +510,23 @@ class BridgeWorker:
             rid = self._sequence
             active = self._active = _Active(rid, (params or {}).get("sessionId"), sinks)
         try:
-            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+            # A full stdin pipe can block even before the response wait begins.
+            # The caller retires the process tree on timeout, releasing the writer.
+            sent = threading.Event()
+            failures = []
+            def send_request():
+                try:
+                    self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+                except Exception as exc:
+                    failures.append(exc)
+                finally:
+                    sent.set()
+
+            threading.Thread(target=send_request, daemon=True).start()
+            if not sent.wait(seconds_left(deadline)):
+                raise TimeoutError(f"OpenCode ACP timed out writing {method}")
+            if failures:
+                raise failures[0]
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -523,6 +561,8 @@ class BridgeWorker:
                 return message.get("result") or {}
         finally:
             with self._state_lock:
+                if active.sinks is not None and diagnostics_enabled():
+                    _log.info("ACP prompt %d finished %.3fs", rid, time.monotonic() - active.started)
                 active.finished.set()
                 if self._active is not None and self._active.rid == rid:
                     self._active = None
@@ -570,6 +610,8 @@ class BridgeWorker:
                 return
             if active.session_id is not None and session_id is not None and session_id != active.session_id:
                 return
+            if not active.saw_update and diagnostics_enabled():
+                _log.info("ACP prompt %d first update %.3fs", active.rid, time.monotonic() - active.started)
             active.saw_update = True
             text_parts, reasoning_parts = active.sinks[:2]
             native = active.sinks[2] if len(active.sinks) > 2 else None
@@ -611,7 +653,7 @@ class BridgeWorker:
     def match_session(self, signatures, tools_signature):
         best = None
         for session in self._sessions:
-            if session.tools_signature != tools_signature:
+            if not session.represented or session.tools_signature != tools_signature:
                 continue
             if len(session.represented) > len(signatures):
                 continue
@@ -726,13 +768,15 @@ class OpenCodeACPClient:
             self._processes.add(owner)
 
     def _ensure_worker(self, timeout):
-        timeout = effective_timeout(timeout)
-        with self._worker_lock:
+        deadline = time.monotonic() + effective_timeout(timeout)
+        with acquire_until(self._worker_lock, deadline, "worker"):
             with self._lock:
                 if self._cancelled.is_set():
                     raise RuntimeError("OpenCode ACP request was cancelled")
                 worker = self._worker
             if worker is not None and not worker.dead:
+                if diagnostics_enabled():
+                    _log.info("ACP worker reused")
                 return worker
             if worker is not None:
                 worker.close()
@@ -751,7 +795,7 @@ class OpenCodeACPClient:
 
             def start(args):
                 return BridgeWorker(self.command, args, cwd=self.workspace, env=os.environ.copy(),
-                                    initialize_timeout=min(timeout, 30.0), on_spawn=register)
+                                    initialize_timeout=min(seconds_left(deadline), 30.0), on_spawn=register)
 
             try:
                 candidates = [self.args]
@@ -768,7 +812,10 @@ class OpenCodeACPClient:
                     candidates = [list(a) for a in dict.fromkeys((preferred, DEFAULT_ARGS, *FALLBACK_ARGS))]
                 for index, args in enumerate(candidates):
                     try:
+                        started = time.monotonic()
                         worker = start(args)
+                        if diagnostics_enabled():
+                            _log.info("ACP worker started %.3fs", time.monotonic() - started)
                         if self._auto_args:
                             with _startup_lock:
                                 _startup_args[key] = (identity, tuple(args))
@@ -824,7 +871,7 @@ class OpenCodeACPClient:
             raise RuntimeError("OpenCode returned no assistant text; not treating this as success")
         return answer, "".join(reasoning), completion_usage(response.get("usage"))
 
-    def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, timeout):
+    def _prompt_session(self, worker, session, messages, start, *, tools, tool_choice, deadline):
         supported = worker.image_input
         if not supported and _request_has_images(messages):
             # A vision request must not succeed on a text-only guess.
@@ -841,14 +888,14 @@ class OpenCodeACPClient:
                 content = _plain(message).get("content")
                 if isinstance(content, list):
                     images.extend(block for item in content if (block := image_block(item)))
-        answer, reasoning, usage = self._send_prompt(worker, session, prompt, timeout, images)
+        answer, reasoning, usage = self._send_prompt(worker, session, prompt, seconds_left(deadline), images)
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
             # One in-session correction; the rejected reply never reaches Hermes.
             initial = usage
             try:
-                answer, reasoning, usage = self._send_prompt(worker, session, REPAIR.format(reason=exc), timeout)
+                answer, reasoning, usage = self._send_prompt(worker, session, REPAIR.format(reason=exc), seconds_left(deadline))
             except RpcError as repair_error:
                 repair_error.missing_session = False
                 raise
@@ -860,8 +907,8 @@ class OpenCodeACPClient:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         return calls, content, reasoning, usage
 
-    def _open_session(self, worker, tools_signature, timeout):
-        result = worker.new_session(timeout)
+    def _open_session(self, worker, tools_signature, deadline):
+        result = worker.new_session(seconds_left(deadline))
         agent = self.agent
         if agent is None:
             # Without an explicit choice, prefer the tool-less relay agent whenever it is offered.
@@ -872,52 +919,57 @@ class OpenCodeACPClient:
             if option.get("currentValue") != agent:
                 selected = worker.request("session/set_config_option", {
                     "sessionId": result["sessionId"], "configId": option["id"], "value": agent,
-                }, timeout=timeout)
+                }, timeout=seconds_left(deadline))
                 if selected_value(selected, option["id"]) != agent:
                     raise RuntimeError(f"OpenCode agent {agent!r} was not confirmed. No prompt was sent.")
                 result = {**result, "configOptions": selected.get("configOptions", result.get("configOptions"))}
         return worker.add_session(result, tools_signature)
 
-    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, timeout):
-        with worker.rpc_lock:
-            session, start = worker.match_session(signatures, tools_signature)
-            if session is not None:
-                try:
-                    calls, content, reasoning, usage = self._prompt_session(
-                        worker, session, messages, start, tools=tools, tool_choice=tool_choice, timeout=timeout)
-                    return calls, content, reasoning, usage, session
-                except RpcError as exc:
-                    worker.forget(session)
-                    if not exc.missing_session:
-                        raise
-                except BaseException:
-                    worker.forget(session)
-                    raise
-            session = self._open_session(worker, tools_signature, timeout)
+    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, deadline):
+        session, start = worker.match_session(signatures, tools_signature)
+        if session is not None:
             try:
                 calls, content, reasoning, usage = self._prompt_session(
-                    worker, session, messages, 0, tools=tools, tool_choice=tool_choice, timeout=timeout)
+                    worker, session, messages, start, tools=tools, tool_choice=tool_choice, deadline=deadline)
                 return calls, content, reasoning, usage, session
+            except RpcError as exc:
+                worker.forget(session)
+                if not exc.missing_session:
+                    raise
             except BaseException:
                 worker.forget(session)
                 raise
+        session = self._open_session(worker, tools_signature, deadline)
+        try:
+            calls, content, reasoning, usage = self._prompt_session(
+                worker, session, messages, 0, tools=tools, tool_choice=tool_choice, deadline=deadline)
+            return calls, content, reasoning, usage, session
+        except BaseException:
+            worker.forget(session)
+            raise
 
     def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds):
-        timeout = effective_timeout(timeout_seconds)
+        deadline = time.monotonic() + effective_timeout(timeout_seconds)
         messages = messages or []
         signatures = [message_signature(message) for message in messages]
         tools_signature = prompt_signature(tools, tool_choice)
         for attempt in (0, 1):
             worker = None
             try:
-                worker = self._ensure_worker(timeout)
-                calls, content, reasoning, usage, session = self._prompt_on_worker(
-                    worker, messages, signatures, tools_signature,
-                    tools=tools, tool_choice=tool_choice, timeout=timeout)
-                if self._cancelled.is_set():
-                    raise RuntimeError("OpenCode ACP request was cancelled")
-                worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
-                return calls, content, reasoning, usage, session_model(session.config)
+                worker = self._ensure_worker(seconds_left(deadline))
+                with acquire_until(worker.rpc_lock, deadline, "prompt"):
+                    try:
+                        calls, content, reasoning, usage, session = self._prompt_on_worker(
+                            worker, messages, signatures, tools_signature,
+                            tools=tools, tool_choice=tool_choice, deadline=deadline)
+                        if self._cancelled.is_set():
+                            raise RuntimeError("OpenCode ACP request was cancelled")
+                        worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
+                        return calls, content, reasoning, usage, session_model(session.config)
+                    except TimeoutError:
+                        # Only the owner of the turn may retire a timed-out worker.
+                        self._discard_worker(worker)
+                        raise
             except WorkerDied as exc:
                 if worker is not None:
                     self._discard_worker(worker)
@@ -926,10 +978,6 @@ class OpenCodeACPClient:
                 # Respawn only when the lost turn produced nothing, as observed by the bridge.
                 if attempt == 1 or not exc.retryable:
                     raise
-            except TimeoutError:
-                if worker is not None:
-                    self._discard_worker(worker)
-                raise
 
     def _dispatch_completion(self, **kwargs):
         """Sync callers get the result; callers inside a running event loop get an awaitable.

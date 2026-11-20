@@ -1,4 +1,7 @@
 """Warm-process and session-reuse tests; no live inference or credentials."""
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 import json
 import os
 import sys
@@ -135,6 +138,63 @@ class WarmProcessTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(item._processes), 1)
         self.assertFalse(item.is_closed)
+
+    def test_concurrent_turns_isolated_and_queue_timeout_preserves_owner(self):
+        path = self.temp_path()
+        item = self.use("record", path)
+        worker = item._ensure_worker(5)
+        entered, release = threading.Event(), threading.Event()
+        original = worker.remember
+
+        def hold_first_commit(session, signatures, assistant):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("first turn was never released")
+            original(session, signatures, assistant)
+
+        second = [{"role": "user", "content": "independent chat"}]
+        with ThreadPoolExecutor(2) as pool, patch.object(worker, "remember", hold_first_commit):
+            first = pool.submit(complete, item)
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaisesRegex(TimeoutError, "waiting for prompt"):
+                    complete(item, messages=second, timeout=0.1)
+                self.assertIs(item._worker, worker)
+                self.assertEqual(len(self.lines(path)), 1)
+                other = pool.submit(complete, item, second)
+            finally:
+                release.set()
+            self.assertEqual(content(first.result()), "OK")
+            self.assertEqual(content(other.result()), "OK")
+        one, two = self.lines(path)
+        self.assertNotEqual(one["sessionId"], two["sessionId"])
+        self.assertNotIn(USER, two["prompt"])
+
+    def test_session_creation_spends_the_prompt_budget(self):
+        item = self.use()
+        worker = item._ensure_worker(5)
+        request = worker.request
+        budgets = {}
+
+        def measured(method, params, **kwargs):
+            budgets[method] = kwargs["timeout"]
+            if method == "session/new":
+                time.sleep(0.12)
+            return request(method, params, **kwargs)
+
+        with patch.object(worker, "request", measured):
+            complete(item, timeout=2)
+        self.assertLess(budgets["session/prompt"], budgets["session/new"] - 0.1)
+
+    def test_opt_in_timings_omit_chat_content(self):
+        item = self.use()
+        with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_DIAGNOSTICS": "1"}), self.assertLogs(acp._log) as logs:
+            complete(item)
+            complete(item)
+        text = " ".join(logs.output)
+        for field in ("worker started", "worker reused", "prompt queue wait", "first update", "finished"):
+            self.assertIn(field, text)
+        self.assertNotIn(USER, text)
 
     def test_close_reaps_the_warm_process(self):
         item = self.use()
