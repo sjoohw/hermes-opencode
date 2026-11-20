@@ -2,6 +2,10 @@
 
 Connect Hermes to your installed OpenCode CLI (1.x or 2.x) over the Agent Client Protocol (ACP). OpenCode chooses the model, agent and reasoning settings when it creates the ACP session. An existing interactive OpenCode session is separate.
 
+Chat and auxiliary clients in the same Hermes process share one OpenCode worker when their profile, working directory and launch settings match. Each client keeps its own ACP session history. A title request can queue behind chat. Closing one idle client leaves the worker available to the others; the last client closes it. Cancellation of an active request or a dead worker can require a fresh process.
+
+When the selected chat provider is this bridge, `hermes -p <profile> gateway run` starts a background Python thread during provider discovery. It initializes the shared OpenCode process and prepares one ACP session without sending a prompt. Leave the serving gateway running before opening chat. The first matching client adopts that session. A request that arrives during initialization waits for the same worker. Set `HERMES_OPENCODE_ACP_PREWARM=0` to disable gateway prewarming. The gateway startup client keeps the worker alive until gateway shutdown. This only warms the matching gateway process, profile and workspace.
+
 ## Hermes setup
 
 With this local fork installed and enabled, select provider `hermes-opencode-acp` and model `opencode-default` in Hermes. The model name is a Hermes display label. OpenCode receives no model override. You can run a single chat with:

@@ -18,6 +18,7 @@ import threading
 import time
 from types import SimpleNamespace
 import uuid
+import weakref
 
 from .constants import (ARGS_ENV, DEFAULT_ARGS, DEFAULT_MODEL, FALLBACK_ARGS, RELAY_AGENT, VERSION, opencode_agent,
                         opencode_args, opencode_command)
@@ -446,6 +447,7 @@ class BridgeWorker:
         self._dead = threading.Event()
         self._closed = False
         self._sessions = []
+        self.prepared_session = None
         self._sequence = 0
         self._cwd = cwd
         self.image_input = False
@@ -722,9 +724,41 @@ class BridgeWorker:
             self._sessions.clear()
 
 
-class OpenCodeACPClient:
+class CompletionAPI:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
+
+    def _dispatch_completion(self, **kwargs):
+        """Sync callers get the result; callers inside a running event loop get an awaitable.
+
+        Hermes awaits clients that declare HERMES_SKIP_ASYNC_WRAP (auxiliary vision) and has no
+        hook for a provider-specific async client. A synchronous call made on an event-loop thread
+        would receive a coroutine; no such path was found in Hermes 0.23.2.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._create_chat_completion(**kwargs)
+        return asyncio.to_thread(self._create_chat_completion, **kwargs)
+
+    def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
+                                timeout=None, stream=False, **kwargs):
+        calls, content, reasoning, usage, model = self._run_prompt(messages, tools=tools,
+                                                     tool_choice=tool_choice, timeout_seconds=timeout)
+        message = Record(role="assistant", content=content, tool_calls=calls,
+                         reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)
+        result = Record(id="acp_" + uuid.uuid4().hex, object="chat.completion", created=int(time.time()), model=model,
+                        choices=[Record(index=0, message=message, finish_reason="tool_calls" if calls else "stop")], usage=usage)
+        if not stream:
+            return result
+        deltas = [Record(index=index, id=call.id, type="function", function=call.function) for index, call in enumerate(calls)]
+        delta = Record(role="assistant", content=content or None, tool_calls=deltas or None,
+                       reasoning_content=reasoning or None, reasoning=reasoning or None)
+        return [Record(id=result.id, model=model, created=result.created, choices=[Record(index=0, delta=delta,
+                       finish_reason=result.choices[0].finish_reason)], usage=usage)]
+
+
+class OpenCodeACPClient(CompletionAPI):
 
     def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None,
                  agent=None, **kwargs):
@@ -927,6 +961,11 @@ class OpenCodeACPClient:
 
     def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, deadline):
         session, start = worker.match_session(signatures, tools_signature)
+        if session is None and worker.prepared_session is not None:
+            session = worker.prepared_session
+            worker.prepared_session = None
+            session.tools_signature = tools_signature
+            start = 0
         if session is not None:
             try:
                 calls, content, reasoning, usage = self._prompt_session(
@@ -948,11 +987,11 @@ class OpenCodeACPClient:
             worker.forget(session)
             raise
 
-    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds):
+    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, namespace=None):
         deadline = time.monotonic() + effective_timeout(timeout_seconds)
         messages = messages or []
         signatures = [message_signature(message) for message in messages]
-        tools_signature = prompt_signature(tools, tool_choice)
+        tools_signature = (namespace, prompt_signature(tools, tool_choice))
         for attempt in (0, 1):
             worker = None
             try:
@@ -979,31 +1018,98 @@ class OpenCodeACPClient:
                 if attempt == 1 or not exc.retryable:
                     raise
 
-    def _dispatch_completion(self, **kwargs):
-        """Sync callers get the result; callers inside a running event loop get an awaitable.
+# A Hermes process can construct separate chat and auxiliary clients in one
+# profile. Share the CLI transport, while keeping each client's history private.
+_shared_workers = {}
+_shared_lock = threading.Lock()
 
-        Hermes awaits clients that declare HERMES_SKIP_ASYNC_WRAP (auxiliary vision) and has no
-        hook for a provider-specific async client. A synchronous call made on an event-loop thread
-        would receive a coroutine; no such path was found in Hermes 0.23.2.
-        """
+
+class SharedWorker:
+    def __init__(self, transport):
+        self.transport = transport
+        self.turn = threading.Lock()
+        self.active = None
+        self.references = 0
+
+
+def release_client(key, slot, token):
+    with _shared_lock:
+        slot.references -= 1
+        last = slot.references == 0
+        if last:
+            del _shared_workers[key]
+        transport = slot.transport if last or slot.active is token else None
+        if transport is not None:
+            slot.transport = None
+    if transport is not None:
+        transport.close()
+
+
+class SharedACPClient(CompletionAPI):
+    def __init__(self, profile_home, **kwargs):
+        transport = OpenCodeACPClient(**kwargs)
+        self._kwargs = kwargs
+        self._token = object()
+        key = (os.path.normcase(os.path.realpath(profile_home)), transport.workspace,
+               transport.command, tuple(transport.args), transport._auto_args, transport.agent,
+               tuple(os.getenv(k) for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME")))
+        with _shared_lock:
+            if key not in _shared_workers:
+                _shared_workers[key] = SharedWorker(transport)
+            self._slot = _shared_workers[key]
+            self._slot.references += 1
+        self._release = weakref.finalize(self, release_client, key, self._slot, self._token)
+        self.chat = Record(completions=Record(create=self._dispatch_completion))
+        self.base_url = transport.base_url
+
+    def prewarm(self):
+        """Prepare one unused session on this process's transport, without inference."""
+        slot = self._slot
+        if not slot.turn.acquire(blocking=False):
+            return
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return self._create_chat_completion(**kwargs)
-        return asyncio.to_thread(self._create_chat_completion, **kwargs)
+            with _shared_lock:
+                transport = slot.transport
+                if self.is_closed or transport is None:
+                    return
+            deadline = time.monotonic() + 30
+            worker = transport._ensure_worker(seconds_left(deadline))
+            with acquire_until(worker.rpc_lock, deadline, "prewarm"):
+                if worker._sessions:
+                    return
+                try:
+                    worker.prepared_session = transport._open_session(worker, None, deadline)
+                except Exception:
+                    transport._discard_worker(worker)
+                    raise
+            if diagnostics_enabled():
+                _log.info("ACP prewarm ready")
+        finally:
+            slot.turn.release()
 
-    def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
-                                timeout=None, stream=False, **kwargs):
-        calls, content, reasoning, usage, model = self._run_prompt(messages, tools=tools,
-                                                     tool_choice=tool_choice, timeout_seconds=timeout)
-        message = Record(role="assistant", content=content, tool_calls=calls,
-                         reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)
-        result = Record(id="acp_" + uuid.uuid4().hex, object="chat.completion", created=int(time.time()), model=model,
-                        choices=[Record(index=0, message=message, finish_reason="tool_calls" if calls else "stop")], usage=usage)
-        if not stream:
-            return result
-        deltas = [Record(index=index, id=call.id, type="function", function=call.function) for index, call in enumerate(calls)]
-        delta = Record(role="assistant", content=content or None, tool_calls=deltas or None,
-                       reasoning_content=reasoning or None, reasoning=reasoning or None)
-        return [Record(id=result.id, model=model, created=result.created, choices=[Record(index=0, delta=delta,
-                       finish_reason=result.choices[0].finish_reason)], usage=usage)]
+    @property
+    def is_closed(self):
+        return not self._release.alive
+
+    def close(self):
+        self._release()
+
+    cancel = close
+
+    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds):
+        deadline = time.monotonic() + effective_timeout(timeout_seconds)
+        slot = self._slot
+        with acquire_until(slot.turn, deadline, "shared transport"):
+            with _shared_lock:
+                if self.is_closed:
+                    raise RuntimeError("OpenCode ACP request was cancelled")
+                if slot.transport is None:
+                    slot.transport = OpenCodeACPClient(**self._kwargs)
+                transport = slot.transport
+                slot.active = self._token
+            try:
+                return transport._run_prompt(messages, tools=tools, tool_choice=tool_choice,
+                                             timeout_seconds=seconds_left(deadline), namespace=self._token)
+            finally:
+                with _shared_lock:
+                    slot.active = None

@@ -130,6 +130,41 @@ class WarmProcessTests(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
+    def test_gateway_prewarm_sends_no_prompt_and_first_client_adopts_session(self):
+        path = self.temp_path()
+        args = [str(ROOT / "tests/fake_acp.py"), "record", path]
+        warm, main = [acp.SharedACPClient("warm-profile", command=sys.executable, args=args) for _ in range(2)]
+        self.addCleanup(warm.close)
+        self.addCleanup(main.close)
+        warm.prewarm()
+        worker = warm._slot.transport._worker
+        prepared = worker.prepared_session
+        self.assertIsNotNone(prepared)
+        self.assertFalse(os.path.exists(path))
+        warm.prewarm()
+        self.assertIs(worker.prepared_session, prepared)
+        complete(main)
+        self.assertEqual(self.lines(path)[0]["sessionId"], prepared.session_id)
+        self.assertIsNone(worker.prepared_session)
+
+    def test_chat_and_aux_share_process_not_history(self):
+        path = self.temp_path()
+        args = [str(ROOT / "tests/fake_acp.py"), "record", path]
+        main, aux = [acp.SharedACPClient("profile-a", command=sys.executable, args=args) for _ in range(2)]
+        self.addCleanup(main.close)
+        self.addCleanup(aux.close)
+        with patch.object(acp, "BridgeWorker", wraps=acp.BridgeWorker) as spawn:
+            first = complete(main)
+            followup = [{"role": "user", "content": USER}, {"role": "assistant", "content": content(first)},
+                        {"role": "user", "content": "continue"}]
+            complete(aux, followup)
+            aux.close()
+            complete(main, followup)
+            self.assertEqual(spawn.call_count, 1)
+        chat, title, continued = self.lines(path)
+        self.assertNotEqual(chat["sessionId"], title["sessionId"])
+        self.assertEqual(chat["sessionId"], continued["sessionId"])
+
     def test_one_process_serves_two_calls_and_stays_open(self):
         item = self.use("pid")
         first = content(complete(item))
