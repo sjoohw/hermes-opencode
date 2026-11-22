@@ -160,6 +160,15 @@ for line in sys.stdin:
             text = '<hermes_tool_call>{"id":"c1","type":"function","function":{"name":"check_connection","arguments":"{}"}}'
             if SCENARIO == "bad-tool-once" and PROMPTS > 1:
                 text += "</hermes_tool_call>"
+        if SCENARIO in ("dsml-repair", "dsml-invalid"):
+            packets = []
+            for idx in range(3):
+                body = json.dumps({"id": f"d{idx}", "type": "function", "function": {
+                    "name": "check_connection", "arguments": json.dumps({"marker": "private-fixture"})}})
+                if idx == 1 and (PROMPTS == 1 or SCENARIO == "dsml-invalid"):
+                    body = body[:-1]
+                packets.append("<｜DSML｜hermes_tool_call>" + body + "</｜DSML｜hermes_tool_call>")
+            text = "\n".join(packets)
         if SCENARIO == "empty":
             text = ""
         if SCENARIO == "tool":

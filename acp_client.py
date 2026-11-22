@@ -387,6 +387,11 @@ def image_recall_context(messages, tools, start=0):
               "Return the remote tool call, not a promise to inspect. Once its result is present, answer.")
 
 
+# Some models decorate the outer envelope with DSML. Match boundaries only:
+# tool arguments can themselves contain literal tags and must survive intact.
+_TOOL_TAG = re.compile(r"<(/?)(?:[｜|]DSML[｜|])?hermes_tool_call>")
+
+
 def parse_tool_calls(text, tools=None, tool_choice=None):
     allowed = {item["function"]["name"] for item in tools or []
                if isinstance(item, dict) and isinstance(item.get("function"), dict)
@@ -394,22 +399,26 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
     calls, prose, cursor, seen = [], [], 0, set()
     search_from = cursor
     while True:
-        start = text.find(OPEN_TAG, search_from)
-        if start < 0:
+        tag = _TOOL_TAG.search(text, search_from)
+        if tag is None:
             prose.append(text[cursor:])
             break
+        start = tag.start()
         # A standalone Markdown code span can name the protocol tag in normal prose.
-        if start > 0 and text[start - 1] == "`" and text.startswith("`", start + len(OPEN_TAG)):
+        if start > 0 and text[start - 1] == "`" and text.startswith("`", tag.end()):
             # Look past quoted mentions while keeping the original prose slice intact.
-            search_from = start + len(OPEN_TAG)
+            search_from = tag.end()
             continue
         prose.append(text[cursor:start])
-        body_start = start + len(OPEN_TAG)
+        if tag.group(1):
+            raise ValueError("Unexpected remote tool-call closing tag")
+        body_start = tag.end()
         body_start += len(text[body_start:]) - len(text[body_start:].lstrip())
         body, consumed = json.JSONDecoder().raw_decode(text[body_start:])
         end = body_start + consumed
         end += len(text[end:]) - len(text[end:].lstrip())
-        if not text.startswith(CLOSE_TAG, end):
+        closing = _TOOL_TAG.match(text, end)
+        if closing is None or not closing.group(1):
             raise ValueError("Incomplete remote tool-call envelope; no tool was dispatched")
         function = body.get("function") if isinstance(body, dict) else None
         if not isinstance(body, dict) or body.get("type") != "function" or not isinstance(function, dict) or function.get("name") not in allowed:
@@ -428,7 +437,7 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
         seen.add(call_id)
         calls.append(Record(id=call_id, type="function", call_id=call_id, response_item_id=None,
                             function=Record(name=function["name"], arguments=json.dumps(decoded, ensure_ascii=False))))
-        cursor = end + len(CLOSE_TAG)
+        cursor = closing.end()
         search_from = cursor
     if not calls and (tool_choice == "required" or isinstance(tool_choice, dict)):
         raise ValueError("The requested remote tool call is missing")

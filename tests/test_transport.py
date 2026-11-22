@@ -184,7 +184,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_no_private_hermes_imports(self):
         for path in ROOT.glob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text())):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.ImportFrom):
                     self.assertFalse((node.module or "").startswith(("agent.", "hermes_cli.")), (path.name, node.module))
 

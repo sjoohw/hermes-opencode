@@ -96,6 +96,18 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(prompts[0]["sessionId"], prompts[1]["sessionId"])
         self.assertTrue(prompts[1]["prompt"].startswith("Your previous reply could not be dispatched"))
 
+    def test_dsml_batch_is_repaired_before_dispatch(self):
+        message = self.complete(self.use("dsml-repair"), TOOLS).choices[0].message
+        self.assertFalse(message.content)
+        self.assertEqual([call.id for call in message.tool_calls], ["d0", "d1", "d2"])
+        self.assertTrue(all(json.loads(c.function.arguments) == {"marker": "private-fixture"}
+                            for c in message.tool_calls))
+
+    def test_repeated_invalid_dsml_fails_without_leaking_the_batch(self):
+        with self.assertRaises(ValueError) as error:
+            self.complete(self.use("dsml-invalid"), TOOLS)
+        self.assertNotIn("private-fixture", str(error.exception))
+
     def test_unrepairable_tool_call_is_not_success(self):
         with self.assertRaisesRegex(ValueError, "Incomplete remote tool-call envelope"):
             self.complete(self.use("bad-tool-always"), TOOLS)
