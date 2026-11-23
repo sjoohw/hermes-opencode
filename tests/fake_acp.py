@@ -169,6 +169,11 @@ for line in sys.stdin:
                     body = body[:-1]
                 packets.append("<｜DSML｜hermes_tool_call>" + body + "</｜DSML｜hermes_tool_call>")
             text = "\n".join(packets)
+        if SCENARIO in ("parameter-repair", "parameter-invalid"):
+            text = ('<｜DSML｜tool_call><｜DSML｜parameter name="function" string="true">'
+                    'private-fixture</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_call>')
+            if PROMPTS == 2 and SCENARIO == "parameter-repair":
+                text = '<hermes_tool_call>{"type":"function","function":{"name":"check_connection","arguments":"{}"}}</hermes_tool_call>'
         if SCENARIO == "empty":
             text = ""
         if SCENARIO == "tool":

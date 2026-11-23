@@ -390,6 +390,8 @@ def image_recall_context(messages, tools, start=0):
 # Some models decorate the outer envelope with DSML. Match boundaries only:
 # tool arguments can themselves contain literal tags and must survive intact.
 _TOOL_TAG = re.compile(r"<(/?)(?:[｜|]DSML[｜|])?hermes_tool_call>")
+_DSML_TOOL_MARKUP = re.compile(r"</?[｜|]DSML[｜|](?:tool_calls?|function_calls?|invoke|parameter)\b", re.I)
+
 
 
 def parse_tool_calls(text, tools=None, tool_choice=None):
@@ -439,6 +441,9 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
                             function=Record(name=function["name"], arguments=json.dumps(decoded, ensure_ascii=False))))
         cursor = closing.end()
         search_from = cursor
+    # Inspect only would-be chat text, never strings inside decoded arguments.
+    if any(_DSML_TOOL_MARKUP.search(part) for part in prose):
+        raise ValueError("Unsupported DSML tool envelope; resend using <hermes_tool_call> with JSON")
     if not calls and (tool_choice == "required" or isinstance(tool_choice, dict)):
         raise ValueError("The requested remote tool call is missing")
     return calls, "\n".join(part.strip() for part in prose if part.strip())

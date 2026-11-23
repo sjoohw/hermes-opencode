@@ -103,6 +103,14 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(all(json.loads(c.function.arguments) == {"marker": "private-fixture"}
                             for c in message.tool_calls))
 
+    def test_parameter_dsml_is_repaired_or_rejected_without_chat_content(self):
+        message = self.complete(self.use("parameter-repair"), TOOLS).choices[0].message
+        self.assertFalse(message.content)
+        self.assertEqual([c.function.name for c in message.tool_calls], ["check_connection"])
+        with self.assertRaisesRegex(ValueError, "Unsupported DSML") as error:
+            self.complete(self.use("parameter-invalid"), TOOLS)
+        self.assertNotIn("private-fixture", str(error.exception))
+
     def test_repeated_invalid_dsml_fails_without_leaking_the_batch(self):
         with self.assertRaises(ValueError) as error:
             self.complete(self.use("dsml-invalid"), TOOLS)
