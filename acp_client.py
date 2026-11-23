@@ -775,6 +775,7 @@ class BridgeWorker:
 
 
 class CompletionAPI:
+    api_key = ""  # Hermes reads this during fallback activation. OpenCode owns credentials.
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
@@ -794,7 +795,8 @@ class CompletionAPI:
     def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
                                 timeout=None, stream=False, **kwargs):
         calls, content, reasoning, usage, model = self._run_prompt(messages, tools=tools,
-                                                     tool_choice=tool_choice, timeout_seconds=timeout)
+                                                     tool_choice=tool_choice, timeout_seconds=timeout,
+                                                     requested_model=None if model == DEFAULT_MODEL else model)
         message = Record(role="assistant", content=content, tool_calls=calls,
                          reasoning=reasoning or None, reasoning_content=reasoning or None, reasoning_details=None)
         result = Record(id="acp_" + uuid.uuid4().hex, object="chat.completion", created=int(time.time()), model=model,
@@ -1036,7 +1038,7 @@ class OpenCodeACPClient(CompletionAPI):
                                         "No Hermes tool dispatched. Enable the MCP relay for structured calls.") from final_error
         return calls, content, reasoning, usage
 
-    def _open_session(self, worker, tools_signature, deadline):
+    def _open_session(self, worker, tools_signature, deadline, requested_model=None):
         result = worker.new_session(seconds_left(deadline))
         agent = "hermes-mcp" if worker.mcp_key else self.agent
         if worker.mcp_key and not any(agent in options(o) for o in _config_candidates(result, "mode")):
@@ -1055,11 +1057,20 @@ class OpenCodeACPClient(CompletionAPI):
                 if selected_value(selected, option["id"]) != agent:
                     raise RuntimeError(f"OpenCode agent {agent!r} was not confirmed. No prompt was sent.")
                 result = {**result, "configOptions": selected.get("configOptions", result.get("configOptions"))}
+        if requested_model:
+            option = config_option(result, "model", requested_model)
+            if option.get("currentValue") != requested_model:
+                selected = worker.request("session/set_config_option", {
+                    "sessionId": result["sessionId"], "configId": option["id"], "value": requested_model,
+                }, timeout=seconds_left(deadline))
+                if selected_value(selected, option["id"]) != requested_model:
+                    raise ValueError(f"[ACP-MODEL] OpenCode did not confirm {requested_model!r}. No prompt was sent.")
+                result = {**result, "configOptions": selected["configOptions"]}
         return worker.add_session(result, tools_signature)
 
-    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, deadline):
+    def _prompt_on_worker(self, worker, messages, signatures, tools_signature, *, tools, tool_choice, deadline, requested_model):
         session, start = worker.match_session(signatures, tools_signature)
-        if session is None and worker.prepared_session is not None:
+        if session is None and not requested_model and worker.prepared_session is not None:
             session = worker.prepared_session
             worker.prepared_session = None
             session.tools_signature = tools_signature
@@ -1076,7 +1087,7 @@ class OpenCodeACPClient(CompletionAPI):
             except BaseException:
                 worker.forget(session)
                 raise
-        session = self._open_session(worker, tools_signature, deadline)
+        session = self._open_session(worker, tools_signature, deadline, requested_model)
         try:
             calls, content, reasoning, usage = self._prompt_session(
                 worker, session, messages, 0, tools=tools, tool_choice=tool_choice, deadline=deadline)
@@ -1085,8 +1096,8 @@ class OpenCodeACPClient(CompletionAPI):
             worker.forget(session)
             raise
 
-    def _check_relay(self, worker, deadline):
-        session = self._open_session(worker, None, deadline)
+    def _check_relay(self, worker, deadline, requested_model=None):
+        session = self._open_session(worker, None, deadline, requested_model)
         try:
             agent = selected_value(session.config, "mode") or "unknown"
             model = session_model(session.config)
@@ -1105,11 +1116,11 @@ class OpenCodeACPClient(CompletionAPI):
         finally:
             worker.forget(session)
 
-    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, namespace=None):
+    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, namespace=None, requested_model=None):
         deadline = time.monotonic() + effective_timeout(timeout_seconds)
         messages = messages or []
         signatures = [message_signature(message) for message in messages]
-        tools_signature = (namespace, prompt_signature(tools, tool_choice))
+        tools_signature = (namespace, requested_model, prompt_signature(tools, tool_choice))
         for attempt in (0, 1):
             worker = None
             try:
@@ -1121,10 +1132,10 @@ class OpenCodeACPClient(CompletionAPI):
                             body = render_content(last.get("content")).strip()
                             user_text = body.rsplit("\n[New message]\n", 1)[-1].strip()
                             if user_text in ("acp-check", "acp-chk", "!acp-check"):
-                                return self._check_relay(worker, deadline)
+                                return self._check_relay(worker, deadline, requested_model)
                         calls, content, reasoning, usage, session = self._prompt_on_worker(
                             worker, messages, signatures, tools_signature,
-                            tools=tools, tool_choice=tool_choice, deadline=deadline)
+                            tools=tools, tool_choice=tool_choice, deadline=deadline, requested_model=requested_model)
                         if self._cancelled.is_set():
                             raise RuntimeError("OpenCode ACP request was cancelled")
                         worker.remember(session, signatures, Record(role="assistant", content=content, tool_calls=calls))
@@ -1220,7 +1231,7 @@ class SharedACPClient(CompletionAPI):
 
     cancel = close
 
-    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds):
+    def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, requested_model=None):
         deadline = time.monotonic() + effective_timeout(timeout_seconds)
         slot = self._slot
         with acquire_until(slot.turn, deadline, "shared transport"):
@@ -1233,7 +1244,7 @@ class SharedACPClient(CompletionAPI):
                 slot.active = self._token
             try:
                 return transport._run_prompt(messages, tools=tools, tool_choice=tool_choice,
-                                             timeout_seconds=seconds_left(deadline), namespace=self._token)
+                                             timeout_seconds=seconds_left(deadline), namespace=self._token, requested_model=requested_model)
             finally:
                 with _shared_lock:
                     slot.active = None

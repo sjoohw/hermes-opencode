@@ -48,6 +48,19 @@ class GuardTests(unittest.TestCase):
             message = item.chat.completions.create(messages=[{"role": "user", "content": "Explain acp-check"}])
             self.assertEqual(message.choices[0].message.content, "FAKE_ACP_OK")
 
+    def test_shared_client_explicit_fallback_without_key(self):
+        item = acp.SharedACPClient("fallback-profile", command=sys.executable,
+                                   args=[str(ROOT / "tests/fake_acp.py"), "fallback"])
+        self.addCleanup(item.close)
+        self.assertEqual(item.api_key, "")
+        item.prewarm()
+        messages = [{"role": "user", "content": "hi"}]
+        create = item.chat.completions.create
+        self.assertEqual(create(model="example/other-model", messages=messages).model, "example/other-model")
+        self.assertEqual(create(model=constants.DEFAULT_MODEL, messages=messages).model, "example/default-model")
+        with self.assertRaisesRegex(RuntimeError, "not advertised"):
+            create(model="example/missing", messages=messages)
+
     def test_native_tool_that_ran_fails_the_turn(self):
         with self.assertRaisesRegex(acp.NativeToolUsed, "execute"):
             self.complete(self.use("native-ran"))

@@ -77,9 +77,9 @@ for line in sys.stdin:
     elif method == "session/set_config_option":
         params = request["params"]
         # Only operator-selected agents may change; models stay with OpenCode.
-        if params["configId"] != "mode" or SCENARIO != "agent":
+        if (params["configId"], SCENARIO) not in (("mode", "agent"), ("model", "fallback")):
             raise AssertionError("Bridge changed OpenCode session settings")
-        SESSIONS[params["sessionId"]]["mode"] = params["value"]
+        SESSIONS[params["sessionId"]][params["configId"]] = params["value"]
         result = {"configOptions": config(params["sessionId"])}
     elif method == "session/prompt":
         params = request["params"]

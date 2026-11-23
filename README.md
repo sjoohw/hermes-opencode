@@ -42,7 +42,7 @@ Paste this request into an OpenCode coding session on the host that runs Hermes.
 
 ## Hermes setup
 
-With this local fork installed and enabled, select provider `hermes-opencode-acp` and model `opencode-default` in Hermes. The model name is a Hermes display label. OpenCode receives no model override. You can run a single chat with:
+With this local fork installed and enabled, select provider `hermes-opencode-acp` and model `opencode-default` in Hermes. With this label, the bridge uses the OpenCode session default. You can run a single chat with:
 
 ```sh
 hermes chat --provider hermes-opencode-acp --model opencode-default
@@ -51,6 +51,18 @@ hermes chat --provider hermes-opencode-acp --model opencode-default
 OpenCode uses the working directory passed to the client (otherwise the Hermes process working directory), its normal configuration and the process environment. Set `HERMES_OPENCODE_ACP_COMMAND` to the OpenCode CLI's absolute executable path if several installations are available. Hermes communicates with OpenCode over stdio. OpenCode manages its own model configuration and credentials.
 
 The bridge supports OpenCode 1.x and 2.x (checked with 1.19.6 and 2.0.32) without extra settings. It starts the CLI with `acp --pure --port 4885`. If initialization fails, it retries with `acp --pure` (normal port selection), then with `acp` for 2.x, which rejects `--pure` and `--port`. Within the Hermes process, later workers try the last successful arguments for that executable first. A changed executable or failed handshake triggers discovery again. Hermes always communicates over stdio. To force specific arguments, set `HERMES_OPENCODE_ACP_ARGS`, for example `acp --pure`. It replaces the whole argument list and disables the retries.
+
+## Fallback through OpenCode
+
+From 0.6.3, keep the primary model set to `opencode-default` and add a fallback in the profile's `config.yaml`. Replace the example model with the exact model ID advertised by the installed OpenCode ACP server. Hermes uses the same provider for both routes. OpenCode handles authentication.
+
+```yaml
+fallback_providers:
+  - provider: hermes-opencode-acp
+    model: example/backup-model
+```
+
+Omit `api_key` and `base_url`. Explicit model IDs require ACP model config options. If the requested model is unavailable or selection fails, the plugin stops before sending the prompt.
 
 ## Hermes-owned tools: the relay agent
 
