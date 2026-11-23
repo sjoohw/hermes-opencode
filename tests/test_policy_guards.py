@@ -38,6 +38,16 @@ class GuardTests(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
+    def test_plain_relay_check_in_tui_and_gateway_messages(self):
+        with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_MCP": "0", "HERMES_OPENCODE_ACP_AGENT": ""}):
+            item = self.use("normal")
+            for body in ("acp-check", "acp-chk", "channel context\n\n[New message]\nacp-check", "!acp-check"):
+                with self.subTest(body=body):
+                    message = item.chat.completions.create(messages=[{"role": "user", "content": body}])
+                    self.assertIn("MCP OFF", message.choices[0].message.content)
+            message = item.chat.completions.create(messages=[{"role": "user", "content": "Explain acp-check"}])
+            self.assertEqual(message.choices[0].message.content, "FAKE_ACP_OK")
+
     def test_native_tool_that_ran_fails_the_turn(self):
         with self.assertRaisesRegex(acp.NativeToolUsed, "execute"):
             self.complete(self.use("native-ran"))

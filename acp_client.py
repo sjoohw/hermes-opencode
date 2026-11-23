@@ -1119,7 +1119,8 @@ class OpenCodeACPClient(CompletionAPI):
                         last = _plain(messages[-1]) if messages else {}
                         if isinstance(last, dict) and last.get("role") == "user":
                             body = render_content(last.get("content")).strip()
-                            if body == "!acp-check" or body.endswith("\n[New message]\n!acp-check"):
+                            user_text = body.rsplit("\n[New message]\n", 1)[-1].strip()
+                            if user_text in ("acp-check", "acp-chk", "!acp-check"):
                                 return self._check_relay(worker, deadline)
                         calls, content, reasoning, usage, session = self._prompt_on_worker(
                             worker, messages, signatures, tools_signature,
