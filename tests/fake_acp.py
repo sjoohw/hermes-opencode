@@ -158,8 +158,7 @@ for line in sys.stdin:
             assert text in prompt
         if SCENARIO in ("bad-tool-once", "bad-tool-always"):
             text = '<hermes_tool_call>{"id":"c1","type":"function","function":{"name":"check_connection","arguments":"{}"}}'
-            if SCENARIO == "bad-tool-once" and PROMPTS > 1:
-                text += "</hermes_tool_call>"
+            text += "</hermes_tool_call>" if SCENARIO == "bad-tool-once" and PROMPTS > 1 else "</broken>"
         if SCENARIO in ("dsml-repair", "dsml-invalid"):
             packets = []
             for idx in range(3):

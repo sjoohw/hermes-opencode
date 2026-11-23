@@ -116,6 +116,17 @@ class GuardTests(unittest.TestCase):
             self.complete(self.use("dsml-invalid"), TOOLS)
         self.assertNotIn("private-fixture", str(error.exception))
 
+    def test_complete_json_without_final_tag(self):
+        text = '<hermes_tool_call>{"type":"function","function":{"name":"check_connection","arguments":{}}}'
+        calls, prose = acp.parse_tool_calls(text, TOOLS)
+        self.assertEqual([c.function.name for c in calls], ["check_connection"])
+        self.assertFalse(prose)
+        for bad in (text[:-1], text + " unfinished", "Example: " + text):
+            with self.assertRaises(ValueError):
+                acp.parse_tool_calls(bad, TOOLS)
+        with self.assertRaises(ValueError):
+            acp.parse_tool_calls(text, TOOLS, "none")
+
     def test_unrepairable_tool_call_is_not_success(self):
         with self.assertRaisesRegex(ValueError, "Incomplete remote tool-call envelope"):
             self.complete(self.use("bad-tool-always"), TOOLS)

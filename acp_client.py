@@ -40,6 +40,7 @@ CONTRACT = (
     "All tools described below are REMOTE Hermes tools. To request one, emit ONLY "
     '<hermes_tool_call>{"id":"unique_call_id","type":"function","function":'
     '{"name":"tool_name","arguments":"{...}"}}</hermes_tool_call> as your final TEXT response. '
+    "The final closing tag is optional when the complete JSON object ends the response. "
     "arguments must be a JSON object encoded as a JSON string. Stop after requesting the tool; "
     "Hermes executes it AFTER your response and supplies the result in the next transcript. "
     "Do NOT use native OpenCode tools, shell, files, skills, or subagents: leave execution to Hermes. "
@@ -420,7 +421,11 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
         end = body_start + consumed
         end += len(text[end:]) - len(text[end:].lstrip())
         closing = _TOOL_TAG.match(text, end)
-        if closing is None or not closing.group(1):
+        # A complete JSON object at the end of a tool-only reply is self-delimiting.
+        bare_end = (closing is None and end == len(text) and not any(p.strip() for p in prose)
+                    and isinstance(body, dict) and isinstance(body.get("function"), dict)
+                    and "arguments" in body["function"])
+        if not bare_end and (closing is None or not closing.group(1)):
             raise ValueError("Incomplete remote tool-call envelope; no tool was dispatched")
         function = body.get("function") if isinstance(body, dict) else None
         if not isinstance(body, dict) or body.get("type") != "function" or not isinstance(function, dict) or function.get("name") not in allowed:
@@ -439,7 +444,7 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
         seen.add(call_id)
         calls.append(Record(id=call_id, type="function", call_id=call_id, response_item_id=None,
                             function=Record(name=function["name"], arguments=json.dumps(decoded, ensure_ascii=False))))
-        cursor = closing.end()
+        cursor = end if bare_end else closing.end()
         search_from = cursor
     # Inspect only would-be chat text, never strings inside decoded arguments.
     if any(_DSML_TOOL_MARKUP.search(part) for part in prose):
@@ -915,6 +920,9 @@ class OpenCodeACPClient(CompletionAPI):
             raise NativeToolUsed(f"OpenCode ran native tools outside Hermes approval (kinds: {', '.join(ran)}); "
                                  "reply discarded. Select a tool-less agent with HERMES_OPENCODE_ACP_AGENT")
         answer = "".join(text)
+        if response.get("stopReason") in ("max_tokens", "max_turn_requests", "refusal") and (
+                _TOOL_TAG.search(answer) or _DSML_TOOL_MARKUP.search(answer)):
+            raise RuntimeError("OpenCode stopped before finishing the turn; no tool was dispatched")
         if not answer.strip():
             raise RuntimeError("OpenCode returned no assistant text; not treating this as success")
         return answer, "".join(reasoning), completion_usage(response.get("usage"))
