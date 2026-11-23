@@ -58,8 +58,31 @@ class GuardTests(unittest.TestCase):
         create = item.chat.completions.create
         self.assertEqual(create(model="example/other-model", messages=messages).model, "example/other-model")
         self.assertEqual(create(model=constants.DEFAULT_MODEL, messages=messages).model, "example/default-model")
-        with self.assertRaisesRegex(RuntimeError, "not advertised"):
-            create(model="example/missing", messages=messages)
+        with self.assertRaisesRegex(acp.ToolProtocolError, "not advertised") as error:
+            create(model="other-model", messages=messages)
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("example/other-model", str(error.exception))
+
+    def test_unknown_mcp_tool_gets_one_new_turn_before_dispatch(self):
+        client = self.use("normal")
+        worker = acp.Record(mcp_key="synthetic", image_input=False)
+        def reply(name):
+            body = {"type": "function", "function": {"name": name, "arguments": {}}}
+            return acp.OPEN_TAG + json.dumps(body) + acp.CLOSE_TAG, "", None
+        for corrected in (True, False):
+            answers = [reply("invented_tool"), reply("check_connection" if corrected else "invented_tool")]
+            with patch.object(client, "_send_prompt", side_effect=answers) as send:
+                def prompt():
+                    return client._prompt_session(worker, None, [], 0, tools=TOOLS, tool_choice="required",
+                                                  deadline=time.monotonic() + 5)
+                if corrected:
+                    self.assertEqual([c.function.name for c in prompt()[0]], ["check_connection"])
+                else:
+                    with self.assertRaisesRegex(acp.ToolProtocolError, "Repair 1/1 failed"):
+                        prompt()
+                first, second = send.call_args_list
+                self.assertNotEqual(first.args[-1], second.kwargs["turn"])
+                self.assertIn("check_connection", second.args[2])
 
     def test_native_tool_that_ran_fails_the_turn(self):
         with self.assertRaisesRegex(acp.NativeToolUsed, "execute"):

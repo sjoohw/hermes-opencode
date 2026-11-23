@@ -97,6 +97,10 @@ class WorkerDied(RuntimeError):
     retryable = True
 
 
+class UnadvertisedTool(ValueError):
+    pass
+
+
 class ToolProtocolError(ValueError):
     """A deterministic tool failure Hermes should not retry."""
     status_code = 400
@@ -193,6 +197,9 @@ def config_option(session, category, required=None):
         if required is None or required in options(item):
             return item
     offered = sorted({value for item in candidates for value in options(item)})
+    if category == "model":
+        raise ToolProtocolError(f"[ACP-MODEL {VERSION}] Model {required!r} was not advertised. "
+                                f"Use an exact OpenCode model ID: {offered!r}. No prompt was sent.")
     raise RuntimeError(f"OpenCode ACP required {category} {required!r} was not advertised; offered={offered!r}. No prompt was sent.")
 
 
@@ -438,8 +445,10 @@ def parse_tool_calls(text, tools=None, tool_choice=None):
         if not bare_end and (closing is None or not closing.group(1)):
             raise ValueError("Incomplete remote tool-call envelope; no tool was dispatched")
         function = body.get("function") if isinstance(body, dict) else None
-        if not isinstance(body, dict) or body.get("type") != "function" or not isinstance(function, dict) or function.get("name") not in allowed:
+        if not isinstance(body, dict) or body.get("type") != "function" or not isinstance(function, dict) or not isinstance(function.get("name"), str):
             raise ValueError("Unadvertised or invalid remote tool call; no tool was dispatched")
+        if function["name"] not in allowed:
+            raise UnadvertisedTool("Requested tool name was not in the Hermes tool list; no tool was dispatched")
         if tool_choice == "none":
             raise ValueError("Remote tool call violates tool_choice=none")
         if isinstance(tool_choice, dict) and function["name"] != (tool_choice.get("function") or {}).get("name"):
@@ -1017,12 +1026,19 @@ class OpenCodeACPClient(CompletionAPI):
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
-            if turn:
+            if turn and not isinstance(exc, UnadvertisedTool):
                 raise ToolProtocolError(f"[ACP-MCP-VALIDATION] {exc}. Check the requested tool schema and choice.") from exc
             # One in-session correction; the rejected reply never reaches Hermes.
             initial = usage
+            correction = REPAIR.format(reason=exc)
+            if turn:
+                turn = secrets.token_hex(12)
+                correction = ("Hermes rejected the entire batch. No action ran. Use an exact name from the "
+                              "available Hermes tools, or explain if none fits. Reissue any needed requests.\n"
+                              + render_prompt([], tools, tool_choice, contract=mcp_relay.CONTRACT)
+                              + "\nTurn token: " + turn)
             try:
-                answer, reasoning, usage = self._send_prompt(worker, session, REPAIR.format(reason=exc), seconds_left(deadline))
+                answer, reasoning, usage = self._send_prompt(worker, session, correction, seconds_left(deadline), turn=turn)
             except RpcError as repair_error:
                 repair_error.missing_session = False
                 raise
@@ -1034,6 +1050,9 @@ class OpenCodeACPClient(CompletionAPI):
             try:
                 calls, content = parse_tool_calls(answer, tools, tool_choice)
             except ValueError as final_error:
+                if turn:
+                    raise ToolProtocolError(f"[ACP-MCP-VALIDATION {VERSION}] Repair 1/1 failed: {final_error}. "
+                                            "Check the enabled Hermes tools for this profile.") from final_error
                 raise ToolProtocolError(f"[ACP-TOOL-FORMAT {VERSION}] Repair 1/1 failed: {final_error}. "
                                         "No Hermes tool dispatched. Enable the MCP relay for structured calls.") from final_error
         return calls, content, reasoning, usage
