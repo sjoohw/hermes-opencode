@@ -1,5 +1,11 @@
 # Verification
 
+## 0.6.0 structured tool relay
+
+On Windows, OpenCode 1.19.6 with explicitly selected `acp --pure --port 4885`, the bundled `hermes-mcp` agent and `openai/gpt-6-luna` passed `tests/e2e_tool_roundtrip.py`. The script received one synthetic tool request, supplied a fresh ticket code and observed that code in the next answer. This probe exercises the provider client and OpenCode. The corporate build and Mattermost gateway require a deployment check. The installed Hermes error classifier marked the native-tool-origin failure non-retryable and fallback-eligible.
+
+
+
 Checked for 0.5.0 on 2026-11-19: native Windows 11, Python 3.13.5, Hermes 0.23.2, OpenCode 1.19.6 and 2.0.32, and the OpenCode-selected model `openai/gpt-6-luna`. Chat and image follow-ups through a Mattermost gateway were confirmed by the user.
 
 ## Offline

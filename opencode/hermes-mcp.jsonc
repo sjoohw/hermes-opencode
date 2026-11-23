@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "hermes-mcp": {
+      "description": "Queue tool requests for Hermes approval",
+      "mode": "primary",
+      "prompt": "Use hermesbridge_request for Hermes tools. End the turn after queueing. Hermes supplies real results on the following turn.",
+      "permission": { "*": "deny", "hermesbridge_request": "allow" }
+    }
+  }
+}

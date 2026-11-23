@@ -26,14 +26,25 @@ When OpenCode offers `hermes-relay`, the bridge selects it on each new ACP sessi
 
 Whatever agent is used, the bridge watches OpenCode's tool notifications. A native tool that OpenCode reports as running or completed fails the turn with `NativeToolUsed`, and that reply is discarded. A native tool that was refused does not fail the turn.
 
+## Structured tool requests with stdio MCP (0.6.0)
+
+1. Merge the agent from [opencode/hermes-mcp.jsonc](opencode/hermes-mcp.jsonc) into the active OpenCode configuration.
+2. Set `HERMES_OPENCODE_ACP_MCP=1` in the environment of the Hermes gateway. Restart the serving gateway.
+3. Ask Hermes to use a read-only tool and then answer from the result. To return to the text relay, unset the variable and restart.
+
+The plugin registers its bundled stdio server on ACP session creation and requires the dedicated `hermes-mcp` agent. Its sole allowed tool, `hermesbridge_request`, queues the requested Hermes tool name and arguments. The plugin verifies the ACP tool identity and a signed receipt for the current turn before returning the request to the ordinary Hermes tool loop. Approval and execution happen there. The following model turn receives the result. The plugin uses the installed Python and requires no separate MCP package.
+
+Gateway errors include a short diagnostic code. `ACP-MCP-AGENT` means the serving OpenCode instance did not advertise the configured agent. `ACP-TOOL-ORIGIN` reports the agent, recognized tool name, ACP kind and observed status. An unknown name or kind means the event did not identify it sufficiently. If it already started, check its outcome before resending. `ACP-MCP-MISSING` means the model printed a request without a verified MCP event. `ACP-TOOL-FORMAT` identifies a failed correction in the text relay. For troubleshooting, share the provider message with its code. Tool arguments and raw command titles are excluded.
+
 ## Environment variables
 
-All three are optional. Set them in the environment that starts Hermes, including a gateway started in the background.
+These settings are optional. Set them in the environment that starts Hermes, including a gateway started in the background.
 
 | Variable | Effect |
 |---|---|
 | `HERMES_OPENCODE_ACP_COMMAND` | Absolute path of the OpenCode executable. Without it, the bridge uses `opencode` on `PATH`, then common install folders. |
 | `HERMES_OPENCODE_ACP_ARGS` | Whole argument list, split on spaces. Disables the startup retries. |
+| `HERMES_OPENCODE_ACP_MCP` | Set to 1 to use the bundled stdio MCP relay and require the hermes-mcp agent. |
 | `HERMES_OPENCODE_ACP_AGENT` | Agent to require. A missing agent fails the request before any prompt is sent. |
 
 A Hermes process keeps the environment and plugin code it started with. After changing a variable or the installed plugin, restart the Hermes gateway (`hermes gateway restart --detach`).

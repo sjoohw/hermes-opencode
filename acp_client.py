@@ -12,6 +12,8 @@ import math
 import os
 import queue
 import re
+import secrets
+import sys
 import shutil
 import subprocess
 import threading
@@ -23,6 +25,7 @@ import weakref
 from .constants import (ARGS_ENV, DEFAULT_ARGS, DEFAULT_MODEL, FALLBACK_ARGS, RELAY_AGENT, VERSION, opencode_agent,
                         opencode_args, opencode_command)
 from .launcher import ProcessTree
+from . import mcp_relay
 
 _startup_args = {}
 _startup_lock = threading.Lock()
@@ -94,15 +97,22 @@ class WorkerDied(RuntimeError):
     retryable = True
 
 
-class NativeToolUsed(RuntimeError):
-    """OpenCode ran one of its own tools, outside Hermes validation and approval."""
+class ToolProtocolError(ValueError):
+    """A deterministic tool failure Hermes should not retry."""
+    status_code = 400
+
+
+class NativeToolUsed(ToolProtocolError):
+    """OpenCode reported activity outside the verified Hermes tool path."""
 
 
 class RpcError(RuntimeError):
     """A JSON-RPC error response. Vendor text is never echoed or logged."""
-    def __init__(self, method, code, *, missing_session=False):
+    def __init__(self, method, code, *, missing_session=False, cause=None):
         self.missing_session = missing_session
-        super().__init__(f"OpenCode ACP {method} failed (code {code}); vendor error text was not logged")
+        hint = {"provider.quota": "provider.quota: check OpenCode quota",
+                "provider.auth": "provider.auth: check OpenCode credentials"}.get(cause, "OpenCode supplied no recognized cause")
+        super().__init__(f"[ACP-RPC] stage={method} code={code}. {hint}.")
         self.method = method
         self.code = code
 
@@ -313,8 +323,8 @@ def render_transcript(messages, images=True):
     return "\n\n".join(parts)
 
 
-def render_prompt(messages, tools=None, tool_choice=None, images=True):
-    parts = [CONTRACT]
+def render_prompt(messages, tools=None, tool_choice=None, images=True, contract=CONTRACT):
+    parts = [contract]
     if tools:
         parts.append("Remote Hermes tools (OpenAI function schemas):\n" + json.dumps(tools, ensure_ascii=False))
     if tool_choice is not None:
@@ -323,7 +333,7 @@ def render_prompt(messages, tools=None, tool_choice=None, images=True):
     transcript = render_transcript(messages, images)
     if transcript:
         parts.append(transcript)
-    parts.extend(["Continue from the latest user request, using actual tool results already in the transcript.", CONTRACT])
+    parts.extend(["Continue from the latest user request, using actual tool results already in the transcript.", contract])
     return "\n\n".join(parts)
 
 
@@ -470,6 +480,7 @@ class BridgeWorker:
         self._sequence = 0
         self._cwd = cwd
         self.image_input = False
+        self.mcp_key = secrets.token_hex(32) if os.getenv("HERMES_OPENCODE_ACP_MCP") == "1" else None
         self.rpc_lock = threading.RLock()
         try:
             self.owner = ProcessTree(command, args, cwd=cwd, env=env)
@@ -578,7 +589,7 @@ class BridgeWorker:
                     missing = (method == "session/prompt" and code == -32602 and sid
                                and data.get("sessionId") == sid and not active.saw_update
                                and error.get("message") == f"Invalid params: session not found: {sid}")
-                    raise RpcError(method, code, missing_session=bool(missing))
+                    raise RpcError(method, code, missing_session=bool(missing), cause=name if isinstance(name, str) else None)
                 return message.get("result") or {}
         finally:
             with self._state_lock:
@@ -641,9 +652,24 @@ class BridgeWorker:
             # Never executed here, but recorded so a native run cannot pass silently.
             if native is not None:
                 call_id = str(update.get("toolCallId", len(native)))
-                previous = native.get(call_id, ("pending", None))
-                status = previous[0] if previous[0] in NATIVE_RAN else update.get("status") or previous[0]
-                native[call_id] = (status, update.get("kind") or previous[1])
+                previous = native.get(call_id, ("pending", None, None))
+                incoming = update.get("status")
+                status = incoming if incoming in NATIVE_RAN or previous[0] not in NATIVE_RAN else previous[0]
+                title = previous[2]
+                if title is None and isinstance(update.get("title"), str):
+                    # Titles can contain command lines and paths. Retain only known identifiers.
+                    value = update["title"]
+                    title = value if value in ("hermesbridge_request", "bash", "edit", "read", "write",
+                                                "task", "glob", "grep", "webfetch") else "unrecognized"
+                native[call_id] = (status or previous[0], update.get("kind") or previous[1], title)
+                if len(active.sinks) > 3 and incoming == "completed" and isinstance(update.get("content"), list):
+                    receipts = active.sinks[3]
+                    for block in update["content"]:
+                        content = block.get("content") if isinstance(block, dict) else None
+                        if isinstance(content, dict) and content.get("type") == "text":
+                            value = content.get("text")
+                            if isinstance(value, str) and value.startswith(mcp_relay.PREFIX):
+                                receipts.setdefault(call_id, set()).add(value)
             return
         sink = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}.get(kind)
         content = update.get("content") or {}
@@ -658,7 +684,12 @@ class BridgeWorker:
             pass
 
     def new_session(self, timeout):
-        result = self.request("session/new", {"cwd": self._cwd, "mcpServers": []}, timeout=timeout)
+        servers = []
+        if self.mcp_key:
+            servers.append({"name": "hermesbridge", "command": sys.executable,
+                            "args": ["-I", os.path.abspath(mcp_relay.__file__)],
+                            "env": [{"name": "HERMES_MCP_RECEIPT_KEY", "value": self.mcp_key}]})
+        result = self.request("session/new", {"cwd": self._cwd, "mcpServers": servers}, timeout=timeout)
         if not isinstance(result.get("sessionId"), str) or not result["sessionId"]:
             raise RuntimeError("OpenCode ACP did not return a session ID")
         return result
@@ -909,17 +940,49 @@ class OpenCodeACPClient(CompletionAPI):
             self._processes.discard(worker.owner)
 
     @staticmethod
-    def _send_prompt(worker, session, prompt, timeout, images=()):
+    def _send_prompt(worker, session, prompt, timeout, images=(), turn=None):
         text, reasoning, native = [], [], {}
-        response = worker.request("session/prompt", {"sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
-                       sinks=(text, reasoning, native), timeout=timeout)
+        receipts = {}
+        try:
+            response = worker.request("session/prompt", {
+                "sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
+                sinks=(text, reasoning, native, receipts), timeout=timeout)
+        except (RpcError, WorkerDied) as exc:
+            if any(state[0] in NATIVE_RAN for state in native.values()):
+                raise ToolProtocolError(f"[ACP-TOOL-INTERRUPTED {VERSION}] OpenCode reported tool activity "
+                                        f"before {type(exc).__name__}. Check the action outcome before resending.") from exc
+            raise
         if response.get("stopReason") == "cancelled":
             raise RuntimeError("OpenCode ACP request was cancelled")
-        ran = sorted({str(kind or "unknown") for status, kind in native.values() if status in NATIVE_RAN})
-        if ran:
-            raise NativeToolUsed(f"OpenCode ran native tools outside Hermes approval (kinds: {', '.join(ran)}); "
-                                 "reply discarded. Select a tool-less agent with HERMES_OPENCODE_ACP_AGENT")
+        calls = []
+        for call_id, (status, kind, title) in native.items():
+            if turn and title == "hermesbridge_request" and status == "failed":
+                raise ToolProtocolError(f"[ACP-MCP-CALL {VERSION}] hermesbridge_request failed inside OpenCode. "
+                                        "Check MCP agent permissions and that its Python executable is accessible.")
+            if status not in NATIVE_RAN:
+                continue
+            values = receipts.get(call_id, set())
+            call = (mcp_relay.verify(worker.mcp_key, turn, next(iter(values)))
+                    if turn and title == "hermesbridge_request" and status == "completed" and len(values) == 1 else None)
+            if call and call["id"] not in {c["id"] for c in calls}:
+                calls.append(call)
+                continue
+            mode = selected_value(session.config, "mode") or "unknown"
+            mode = mode if isinstance(mode, str) and re.fullmatch(r"[\w.-]{1,64}", mode) else "unknown"
+            kind = kind if kind in ("read", "edit", "delete", "move", "search", "execute",
+                                    "think", "fetch", "switch_mode", "other") else "unknown"
+            expected = "hermes-mcp" if worker.mcp_key else RELAY_AGENT
+            raise NativeToolUsed(f"[ACP-TOOL-ORIGIN {VERSION}] agent={mode} tool={title or 'unknown'} kind={kind} status={status}. "
+                                 f"OpenCode reported tool activity without a verified Hermes request. "
+                                 f"Check agent {expected} and its tool permissions before retrying.")
         answer = "".join(text)
+        if calls:
+            if response.get("stopReason") != "end_turn":
+                raise ToolProtocolError("[ACP-MCP-STOP] OpenCode did not finish the relay turn. No Hermes call dispatched.")
+            answer = "".join(OPEN_TAG + json.dumps(call) + CLOSE_TAG for call in calls)
+        elif turn and (mcp_relay.PREFIX in answer or _TOOL_TAG.search(answer) or _DSML_TOOL_MARKUP.search(answer)):
+            raise ToolProtocolError("[ACP-MCP-MISSING] Model returned tool text without a verified MCP call. "
+                                 "Check hermes-mcp permissions and that this OpenCode build loads session MCP servers.")
         if response.get("stopReason") in ("max_tokens", "max_turn_requests", "refusal") and (
                 _TOOL_TAG.search(answer) or _DSML_TOOL_MARKUP.search(answer)):
             raise RuntimeError("OpenCode stopped before finishing the turn; no tool was dispatched")
@@ -933,21 +996,27 @@ class OpenCodeACPClient(CompletionAPI):
             # A vision request must not succeed on a text-only guess.
             raise RuntimeError("OpenCode agent did not advertise image input; the new image was not sent. "
                                "Point auxiliary vision at an image-capable backend. No prompt was sent.")
+        turn = secrets.token_hex(12) if worker.mcp_key else None
         if start == 0:
-            prompt = render_prompt(messages, tools, tool_choice, images=supported)
+            prompt = render_prompt(messages, tools, tool_choice, images=supported,
+                                   contract=mcp_relay.CONTRACT if turn else CONTRACT)
         else:
             prompt = render_delta(messages, start, images=supported)
         prompt += image_recall_context(messages, tools, start)
+        if turn:
+            prompt += "\n" + mcp_relay.CONTRACT + "\nTurn token: " + turn
         images = []
         if supported:
             for message in messages[start:]:
                 content = _plain(message).get("content")
                 if isinstance(content, list):
                     images.extend(block for item in content if (block := image_block(item)))
-        answer, reasoning, usage = self._send_prompt(worker, session, prompt, seconds_left(deadline), images)
+        answer, reasoning, usage = self._send_prompt(worker, session, prompt, seconds_left(deadline), images, turn)
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
+            if turn:
+                raise ToolProtocolError(f"[ACP-MCP-VALIDATION] {exc}. Check the requested tool schema and choice.") from exc
             # One in-session correction; the rejected reply never reaches Hermes.
             initial = usage
             try:
@@ -960,12 +1029,19 @@ class OpenCodeACPClient(CompletionAPI):
                 raise
             if diagnostics_enabled() and initial and usage:
                 _log.info("OpenCode ACP corrected turn total tokens: %d", initial.total_tokens + usage.total_tokens)
-            calls, content = parse_tool_calls(answer, tools, tool_choice)
+            try:
+                calls, content = parse_tool_calls(answer, tools, tool_choice)
+            except ValueError as final_error:
+                raise ToolProtocolError(f"[ACP-TOOL-FORMAT {VERSION}] Repair 1/1 failed: {final_error}. "
+                                        "No Hermes tool dispatched. Enable the MCP relay for structured calls.") from final_error
         return calls, content, reasoning, usage
 
     def _open_session(self, worker, tools_signature, deadline):
         result = worker.new_session(seconds_left(deadline))
-        agent = self.agent
+        agent = "hermes-mcp" if worker.mcp_key else self.agent
+        if worker.mcp_key and not any(agent in options(o) for o in _config_candidates(result, "mode")):
+            raise ToolProtocolError(f"[ACP-MCP-AGENT {VERSION}] OpenCode did not offer hermes-mcp. "
+                                    "Merge opencode/hermes-mcp.jsonc into the active OpenCode config and restart the gateway.")
         if agent is None:
             # Without an explicit choice, prefer the tool-less relay agent whenever it is offered.
             offered = [value for item in _config_candidates(result, "mode") for value in options(item)]
@@ -1074,7 +1150,7 @@ class SharedACPClient(CompletionAPI):
         self._token = object()
         key = (os.path.normcase(os.path.realpath(profile_home)), transport.workspace,
                transport.command, tuple(transport.args), transport._auto_args, transport.agent,
-               tuple(os.getenv(k) for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME")))
+               tuple(os.getenv(k) for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME", "HERMES_OPENCODE_ACP_MCP")))
         with _shared_lock:
             if key not in _shared_workers:
                 _shared_workers[key] = SharedWorker(transport)
