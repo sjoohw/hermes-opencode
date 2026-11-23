@@ -1085,6 +1085,26 @@ class OpenCodeACPClient(CompletionAPI):
             worker.forget(session)
             raise
 
+    def _check_relay(self, worker, deadline):
+        session = self._open_session(worker, None, deadline)
+        try:
+            agent = selected_value(session.config, "mode") or "unknown"
+            model = session_model(session.config)
+            label = f"ACP-CHECK {VERSION} | agent={agent}"
+            if not worker.mcp_key:
+                return [], label + " | MCP OFF. Set HERMES_OPENCODE_ACP_MCP=1 on the serving gateway and restart it.", "", None, model
+            token = secrets.token_hex(6)
+            probe = [{"role": "user", "content": f"Request relay_probe with token {token} exactly once."}]
+            tools = [{"type": "function", "function": {"name": "relay_probe", "parameters": {
+                "type": "object", "properties": {"token": {"type": "string"}}, "required": ["token"]}}}]
+            calls, _, _, usage = self._prompt_session(worker, session, probe, 0, tools=tools,
+                                                       tool_choice="required", deadline=deadline)
+            ok = len(calls) == 1 and json.loads(calls[0].function.arguments) == {"token": token}
+            result = "MCP PASS" if ok else "MCP FAIL: probe arguments or call count did not match"
+            return [], f"{label} | {result}", "", usage, model
+        finally:
+            worker.forget(session)
+
     def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, namespace=None):
         deadline = time.monotonic() + effective_timeout(timeout_seconds)
         messages = messages or []
@@ -1096,6 +1116,11 @@ class OpenCodeACPClient(CompletionAPI):
                 worker = self._ensure_worker(seconds_left(deadline))
                 with acquire_until(worker.rpc_lock, deadline, "prompt"):
                     try:
+                        last = _plain(messages[-1]) if messages else {}
+                        if isinstance(last, dict) and last.get("role") == "user":
+                            body = render_content(last.get("content")).strip()
+                            if body == "!acp-check" or body.endswith("\n[New message]\n!acp-check"):
+                                return self._check_relay(worker, deadline)
                         calls, content, reasoning, usage, session = self._prompt_on_worker(
                             worker, messages, signatures, tools_signature,
                             tools=tools, tool_choice=tool_choice, deadline=deadline)
