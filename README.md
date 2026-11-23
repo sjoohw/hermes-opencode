@@ -6,6 +6,40 @@ Chat and auxiliary clients in the same Hermes process share one OpenCode worker 
 
 When the selected chat provider is this bridge, `hermes -p <profile> gateway run` starts a background Python thread during provider discovery. It initializes the shared OpenCode process and prepares one ACP session without sending a prompt. Leave the serving gateway running before opening chat. The first matching client adopts that session. A request that arrives during initialization waits for the same worker. Set `HERMES_OPENCODE_ACP_PREWARM=0` to disable gateway prewarming. The gateway startup client keeps the worker alive until gateway shutdown. This only warms the matching gateway process, profile and workspace.
 
+## Install with OpenCode
+
+Paste this request into an OpenCode coding session on the host that runs Hermes. Replace `<profile>` with your Mattermost profile name.
+
+> Install or update this repository's Hermes plugin for profile `<profile>`. Follow the steps below, enable the stdio MCP relay, and verify one tool round trip. Use the installed OpenCode executable and its selected model. Report the installed version, the profile, the serving gateway, and which checks passed.
+
+1. **Identify the installation.** Run `hermes --version`, `opencode --version` and `hermes -p <profile> plugins list` as the gateway user. The plugin requires Hermes 0.22.2 or newer. Resolve the named profile's home and the gateway that serves it. If status says the default multiplexer serves the profile, that multiplexer is the process to restart.
+2. **Install or update the named plugin.** For a fresh install, run the first command below. For an existing install, run the second. The install source may also be a trusted internal Git URL containing this fork. Use the installed plugin's manifest name, `hermes-opencode-acp`, for enable and update.
+
+   ```sh
+   hermes -p <profile> plugins install https://github.com/sjoohw/hermes-opencode.git
+   hermes -p <profile> plugins update hermes-opencode-acp
+   ```
+
+   Run `hermes -p <profile> plugins enable hermes-opencode-acp` if the plugin is disabled. Confirm the plugin is enabled in that profile and its installed `plugin.yaml` reports version 0.6.0 or newer.
+
+3. **Configure Hermes chat.** In the profile's existing `config.yaml`, merge these two keys under `model`. Preserve the other keys and the profile's auxiliary model settings.
+
+   ```yaml
+   model:
+     provider: hermes-opencode-acp
+     default: opencode-default
+   ```
+
+4. **Configure the OpenCode agent.** Run `opencode debug paths` under the gateway account and honor any active `OPENCODE_CONFIG` override. Merge only `agent.hermes-mcp` from [the bundled agent definition](opencode/hermes-mcp.jsonc) into the active OpenCode config. Preserve its JSONC comments, providers and other agents. The plugin registers its stdio server for each ACP session automatically.
+5. **Activate the relay.** Persist `HERMES_OPENCODE_ACP_MCP=1` in the environment loaded by the serving gateway. Restart that gateway through its existing service manager and confirm it is running. An export in the installer's terminal applies only to processes started from that environment.
+6. **Verify a tool result.** From the installed plugin directory, run the following probe under the gateway account with the same MCP setting and OpenCode config. Supply the absolute CLI path (on Windows, use the executable or `opencode.cmd`). The probe sends two synthetic prompts through the configured model. Expect `ok: true`, `code_in_answer: true`, and agent `hermes-mcp`.
+
+   ```sh
+   python tests/e2e_tool_roundtrip.py --command "<absolute path to opencode>"
+   ```
+
+   For an end-to-end Mattermost check, ask the bot to read the installed plugin's `plugin.yaml` by its absolute path and return its `version` field. Confirm the reply matches the installed manifest. If only the CLI probe was run, report Mattermost as untested. On failure, capture the short provider diagnostic code shown in chat.
+
 ## Hermes setup
 
 With this local fork installed and enabled, select provider `hermes-opencode-acp` and model `opencode-default` in Hermes. The model name is a Hermes display label. OpenCode receives no model override. You can run a single chat with:
