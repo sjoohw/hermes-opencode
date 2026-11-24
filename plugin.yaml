@@ -1,7 +1,7 @@
 manifest_version: 1
 name: hermes-opencode-acp
 kind: model-provider
-version: 0.6.6
+version: 0.6.7
 requires_hermes: ">=0.22.2"
 description: Connect Hermes to your installed OpenCode CLI via ACP
 author: sjoohw

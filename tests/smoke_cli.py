@@ -31,7 +31,7 @@ def main():
             session = worker.new_session(args.timeout)
             model = acp.session_model(session)
         report = {"ok": True, "platform": sys.platform, "bridge_version": constants.VERSION,
-                          "command": client.command, "session_model": model,
+                          "command": client.command, "cwd": client.workspace, "session_model": model,
                           "inference_requested": False}
         if args.list_models:
             models = [value for item in acp._config_candidates(session, "model") for value in acp.options(item)]

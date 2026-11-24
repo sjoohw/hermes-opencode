@@ -52,6 +52,30 @@ class IsolationAndSignatureTests(unittest.TestCase):
                 self.assertEqual(kwargs["env"]["OPENCODE_CONFIG"], "/site/opencode.json")
                 self.assertEqual(kwargs["cwd"], os.getcwd())
 
+    def test_configured_workspace_reaches_warm_process_and_session(self):
+        parent_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory(prefix="acp workspace ") as folder:
+            with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": folder}):
+                clients = [acp.SharedACPClient("profile", command=sys.executable,
+                           args=[str(ROOT / "tests/fake_acp.py"), "cwd"]) for _ in range(2)]
+                warm, chat = clients
+                try:
+                    warm.prewarm()
+                    actual = json.loads(content(complete(chat)))
+                    self.assertEqual([os.path.realpath(path) for path in actual], [os.path.realpath(folder)] * 2)
+                    self.assertIn("cwd_env=active", content(complete(chat, [{"role": "user", "content": "acp-check"}])))
+                    self.assertIs(warm._slot, chat._slot)
+                    self.assertEqual(os.getcwd(), parent_cwd)
+                finally:
+                    chat.close()
+                    warm.close()
+
+    def test_invalid_workspace_fails_before_launch(self):
+        for invalid in ("relative", os.path.abspath(__file__)):
+            with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": invalid}):
+                with self.assertRaisesRegex(ValueError, "ACP-CWD"):
+                    fake()
+
     def test_message_signature_ignores_presentation_fields(self):
         first = {
             "role": "assistant",

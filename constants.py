@@ -3,7 +3,7 @@ import os
 
 from .launcher import resolve_opencode
 
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 DEFAULT_ARGS = ("acp", "--pure", "--port", "4885")
 PROVIDER = "hermes-opencode-acp"
 DEFAULT_MODEL = "opencode-default"  # Hermes label for the CLI-selected model.

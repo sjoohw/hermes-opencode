@@ -72,6 +72,8 @@ for line in sys.stdin:
         values = {"mode": "plan", "model": "example/default-model"}
         if SCENARIO != "missing-effort":
             values["effort"] = "high"
+        if SCENARIO == "cwd":
+            values["cwd"] = request["params"]["cwd"]
         SESSIONS[session_id] = values
         result = {"sessionId": session_id, "configOptions": config(session_id)}
     elif method == "session/set_config_option":
@@ -145,6 +147,8 @@ for line in sys.stdin:
                     assert reply["error"]["code"] == -32601
         record(session_id, prompt, params["prompt"])
         text = "FAKE_ACP_OK"
+        if SCENARIO == "cwd":
+            text = json.dumps([os.getcwd(), SESSIONS[session_id]["cwd"]])
         if SCENARIO == "pid":
             text = "PID:" + str(os.getpid())
         if SCENARIO in ("record", "missing-effort", "agent", "image"):

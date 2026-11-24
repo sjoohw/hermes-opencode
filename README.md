@@ -48,9 +48,23 @@ With this local fork installed and enabled, select provider `hermes-opencode-acp
 hermes chat --provider hermes-opencode-acp --model opencode-default
 ```
 
-OpenCode uses the working directory passed to the client (otherwise the Hermes process working directory), its normal configuration and the process environment. Set `HERMES_OPENCODE_ACP_COMMAND` to the OpenCode CLI's absolute executable path if several installations are available. Hermes communicates with OpenCode over stdio. OpenCode manages its own model configuration and credentials.
+OpenCode uses the working directory passed to the client, then HERMES_OPENCODE_ACP_CWD if set, then the Hermes process working directory. It uses its normal configuration and the process environment. Set `HERMES_OPENCODE_ACP_COMMAND` to the OpenCode CLI's absolute executable path if several installations are available. Hermes communicates with OpenCode over stdio. OpenCode manages its own model configuration and credentials.
 
 The bridge supports OpenCode 1.x and 2.x (checked with 1.19.6 and 2.0.32) without extra settings. It starts the CLI with `acp --pure --port 4885`. If initialization fails, it retries with `acp --pure` (normal port selection), then with `acp` for 2.x, which rejects `--pure` and `--port`. Within the Hermes process, later workers try the last successful arguments for that executable first. A changed executable or failed handshake triggers discovery again. Hermes always communicates over stdio. To force specific arguments, set `HERMES_OPENCODE_ACP_ARGS`, for example `acp --pure`. It replaces the whole argument list and disables the retries.
+
+## Run OpenCode outside the Hermes repository
+
+If ACP takes seconds after the final text chunk in a large Git checkout, create an empty directory outside all Git worktrees on the gateway host. On Windows, for example:
+
+```powershell
+New-Item -ItemType Directory -Force C:\hermes-acp-work | Out-Null
+```
+
+Set `HERMES_OPENCODE_ACP_CWD=C:/hermes-acp-work` in the environment of the serving gateway and restart it. The directory must exist and be accessible to the service account. The setting applies to the OpenCode process and its ACP sessions, including prewarm. Hermes tools retain their own workspace. OpenCode discovers project-local config and instructions from the new directory, so keep required provider and agent settings available through the gateway account's global config or an absolute `OPENCODE_CONFIG`. Unset the variable and restart to restore the inherited workspace.
+
+Send `acp-check` through the actual gateway and look for `cwd_env=active` to confirm that its worker uses the configured directory.
+
+Use the same model, agent, prompt and CLI arguments to compare repository and empty-directory runs. Enable `HERMES_OPENCODE_ACP_DIAGNOSTICS=1` to measure lock wait, total prompt RPC time and the interval after the last assistant text chunk. That interval can include OpenCode tool processing or other work. Compare like-for-like runs and keep quota retries and cold starts separate.
 
 ## Fallback through OpenCode
 

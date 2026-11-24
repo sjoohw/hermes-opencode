@@ -136,6 +136,8 @@ class _Active:
         self.session_id = session_id
         self.sinks = sinks
         self.started = time.monotonic()
+        self.trace_timing = diagnostics_enabled()
+        self.last_text = None
         self.last_tool_completion = None
         self.saw_update = False
         self.finished = threading.Event()
@@ -608,7 +610,9 @@ class BridgeWorker:
                 return message.get("result") or {}
         finally:
             with self._state_lock:
-                if active.sinks is not None and diagnostics_enabled():
+                if active.sinks is not None and active.trace_timing:
+                    if active.last_text is not None:
+                        _log.info("ACP prompt %d after last assistant text %.3fs", rid, time.monotonic() - active.last_text)
                     if active.last_tool_completion is not None:
                         _log.info("ACP prompt %d after last tool completion %.3fs", rid,
                                   time.monotonic() - active.last_tool_completion)
@@ -660,7 +664,7 @@ class BridgeWorker:
                 return
             if active.session_id is not None and session_id is not None and session_id != active.session_id:
                 return
-            if not active.saw_update and diagnostics_enabled():
+            if not active.saw_update and active.trace_timing:
                 _log.info("ACP prompt %d first update %.3fs", active.rid, time.monotonic() - active.started)
             active.saw_update = True
             text_parts, reasoning_parts = active.sinks[:2]
@@ -693,6 +697,8 @@ class BridgeWorker:
         sink = {"agent_message_chunk": text_parts, "agent_thought_chunk": reasoning_parts}.get(kind)
         content = update.get("content") or {}
         if sink is not None and isinstance(content, dict) and isinstance(content.get("text"), str):
+            if kind == "agent_message_chunk" and content["text"] and active.trace_timing:
+                active.last_text = time.monotonic()
             sink.append(content["text"])
 
     def _discard_stderr(self):
@@ -838,7 +844,11 @@ class OpenCodeACPClient(CompletionAPI):
         self._auto_args = not (acp_args or args or os.getenv(ARGS_ENV, "").strip())
         self.args = list(acp_args or args or opencode_args())
         self.agent = agent or opencode_agent()
-        self.workspace = os.path.abspath(acp_cwd or os.getcwd())
+        env_cwd = os.getenv("HERMES_OPENCODE_ACP_CWD", "").strip()
+        if not acp_cwd and env_cwd and not (os.path.isabs(env_cwd) and os.path.isdir(env_cwd)):
+            raise ValueError("[ACP-CWD] Set HERMES_OPENCODE_ACP_CWD to an existing absolute directory "
+                             "accessible to the gateway account.")
+        self.workspace = os.path.abspath(acp_cwd or env_cwd or os.getcwd())
         self.base_url = "acp://hermes-opencode-acp"
         self.chat = Record(completions=Record(create=self._dispatch_completion))
         self.is_closed = False
@@ -1137,7 +1147,11 @@ class OpenCodeACPClient(CompletionAPI):
         try:
             agent = selected_value(session.config, "mode") or "unknown"
             model = session_model(session.config)
-            label = f"ACP-CHECK {VERSION} | agent={agent}"
+            configured = os.getenv("HERMES_OPENCODE_ACP_CWD", "").strip()
+            cwd_env = "unset"
+            if configured:
+                cwd_env = "active" if os.path.normcase(self.workspace) == os.path.normcase(os.path.abspath(configured)) else "different"
+            label = f"ACP-CHECK {VERSION} | agent={agent} | cwd_env={cwd_env}"
             if not worker.mcp_key:
                 return [], label + " | MCP OFF. Set HERMES_OPENCODE_ACP_MCP=1 on the serving gateway and restart it.", "", None, model
             token = secrets.token_hex(6)
@@ -1219,7 +1233,7 @@ def release_client(key, slot, token):
 class SharedACPClient(CompletionAPI):
     def __init__(self, profile_home, **kwargs):
         transport = OpenCodeACPClient(**kwargs)
-        self._kwargs = kwargs
+        self._kwargs = {**kwargs, "acp_cwd": transport.workspace}
         self._token = object()
         key = (os.path.normcase(os.path.realpath(profile_home)), transport.workspace,
                transport.command, tuple(transport.args), transport._auto_args, transport.agent,
