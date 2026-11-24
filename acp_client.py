@@ -331,9 +331,9 @@ def render_transcript(messages, images=True):
 
 
 def render_prompt(messages, tools=None, tool_choice=None, images=True, contract=CONTRACT):
-    parts = [contract]
+    parts = [contract] if contract == CONTRACT else []
     if tools:
-        parts.append("Remote Hermes tools (OpenAI function schemas):\n" + json.dumps(tools, ensure_ascii=False))
+        parts.append("Remote Hermes tools (OpenAI function schemas):\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
     if tool_choice is not None:
         parts.append("Remote tool choice: " + json.dumps(tool_choice, ensure_ascii=False))
     parts.append("Conversation transcript:")
@@ -1015,7 +1015,7 @@ class OpenCodeACPClient(CompletionAPI):
             prompt = render_delta(messages, start, images=supported)
         prompt += image_recall_context(messages, tools, start)
         if turn:
-            prompt += "\n" + mcp_relay.CONTRACT + "\nTurn token: " + turn
+            prompt += "\nTurn token: " + turn
         images = []
         if supported:
             for message in messages[start:]:
