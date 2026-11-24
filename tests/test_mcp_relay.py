@@ -40,6 +40,31 @@ class MCPTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             acp.parse_tool_calls(answer, [])
 
+    def test_text_only_session_omits_mcp_server(self):
+        worker = object.__new__(acp.BridgeWorker)
+        worker.mcp_key, worker._cwd = self.key, "."
+        sent = []
+        def request(method, params, timeout):
+            sent.append(params["mcpServers"])
+            return {"sessionId": "s"}
+        worker.request = request
+        worker.new_session(1, enable_tools=False)
+        worker.new_session(1)
+        self.assertEqual(sent[0], [])
+        self.assertEqual([s["name"] for s in sent[1]], ["hermesbridge"])
+
+    def test_long_signed_receipt_preserves_arguments_and_order(self):
+        args = dict(self.args, arguments={"script": "한글 sample text\n" * 3000})
+        self.value = acp.mcp_relay.receipt(self.key, args)
+        self.assertLess(len(self.value), len(args["arguments"]["script"]) // 2)
+        events = self.events()
+        self.value = acp.mcp_relay.receipt(self.key, self.args)
+        events.extend(dict(event, toolCallId="y") for event in self.events())
+        answer = self.send(events)
+        calls, _ = acp.parse_tool_calls(answer, [{"function": {"name": "read"}}])
+        self.assertEqual([json.loads(c.function.arguments) for c in calls],
+                         [args["arguments"], self.args["arguments"]])
+
     def test_reject_mixed_origin_replay_and_incomplete_turn(self):
         extra = {"sessionUpdate": "tool_call", "toolCallId": "y", "kind": "execute", "status": "in_progress"}
         for events in (self.events("private fixture"), self.events() + [extra]):

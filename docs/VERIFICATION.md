@@ -1,5 +1,13 @@
 # Verification
 
+## 0.6.6 transport checks
+
+The local Windows probe used OpenCode with the hermes-mcp agent and openai/gpt-6-luna. It returned two requested tool calls, answered a separate text-only request on the same worker, returned both synthetic tool result codes in the original session, and requested another tool there. The offline suite passed 134 tests.
+
+In a synthetic microbenchmark against 0.6.5, a signed receipt carrying 30,000 characters of repetitive tool arguments shrank from 31,505 to 500 bytes. Median message-signature time (five runs of ten iterations) went from 5.92 to 1.36 ms for 1.15 MB of tool output and from 5.80 to 4.16 ms for a 4 MB inline image URL. These timings measure local processing. The two-call live probe still spent 4.23 seconds between its final tool completion and the end of the prompt in one run.
+
+
+
 ## 0.6.0 structured tool relay
 
 On Windows, OpenCode 1.19.6 with explicitly selected `acp --pure --port 4885`, the bundled `hermes-mcp` agent and `openai/gpt-6-luna` passed `tests/e2e_tool_roundtrip.py`. The script received one synthetic tool request, supplied a fresh ticket code and observed that code in the next answer. This probe exercises the provider client and OpenCode. The corporate build and Mattermost gateway require a deployment check. The installed Hermes error classifier marked the native-tool-origin failure non-retryable and fallback-eligible.

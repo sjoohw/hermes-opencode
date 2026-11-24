@@ -136,6 +136,7 @@ class _Active:
         self.session_id = session_id
         self.sinks = sinks
         self.started = time.monotonic()
+        self.last_tool_completion = None
         self.saw_update = False
         self.finished = threading.Event()
 
@@ -237,21 +238,29 @@ def render_content(content, images=True):
     return json.dumps(content, ensure_ascii=False)
 
 
-def image_block(item):
+def _inline_url(item):
     if not isinstance(item, dict) or item.get("type") != "image_url":
         return None
     image = item.get("image_url")
     url = image.get("url") if isinstance(image, dict) else image
     if not isinstance(url, str) or not url.startswith("data:image/"):
         return None
-    header, sep, data = url.partition(",")
-    if not sep or not header.endswith(";base64") or not data:
+    comma = url.find(",")
+    if comma < 0 or not url.endswith(";base64", 0, comma) or comma + 1 == len(url):
         raise ValueError("Malformed inline image")
+    return url
+
+
+def image_block(item):
+    url = _inline_url(item)
+    if url is None:
+        return None
+    header, _, data = url.partition(",")
     return {"type": "image", "mimeType": header[5:-7], "data": data}
 
 
 def _render_part(item, images=True):
-    if image_block(item):
+    if _inline_url(item):
         if images:
             return "[See attached image]"
         return ("[Inline image not forwarded: this OpenCode agent did not advertise image input. "
@@ -293,18 +302,17 @@ def message_signature(message):
         "tool_calls": tool_calls,
         "tool_call_id": data.get("tool_call_id"),
     }
+    # Avoid escaping large tool output into an intermediate JSON string on every turn.
+    text = payload["content"]["text"]
+    if len(text) > 4096:
+        payload["content"]["text"] = {"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
 
 
 def _inline_image_urls(content):
     if not isinstance(content, list):
         return []
-    urls = []
-    for item in content:
-        if image_block(item):
-            image = item.get("image_url")
-            urls.append(image.get("url") if isinstance(image, dict) else image)
-    return urls
+    return [url for item in content if (url := _inline_url(item))]
 
 
 def prompt_signature(tools=None, tool_choice=None):
@@ -346,11 +354,7 @@ def render_prompt(messages, tools=None, tool_choice=None, images=True, contract=
 
 def render_delta(messages, start, images=True):
     transcript = render_transcript((messages or [])[start:], images)
-    parts = ["Continuation of the same conversation. New transcript entries follow."]
-    if transcript:
-        parts.append(transcript)
-    parts.append("Continue the same conversation from the new transcript entries. Use actual tool results already in the transcript.")
-    return "\n\n".join(parts)
+    return "Continuation of the same conversation. Use the new entries below.\n\n" + transcript
 
 
 # Image notes Hermes writes into user messages: gateway (run_inbound.py) and TUI (cli_stream_mixin.py).
@@ -381,13 +385,15 @@ def image_notes(messages):
 
 def _request_has_images(messages):
     """Inline images from the latest user message onward: the input of the current request."""
-    messages = list(messages or [])
-    latest = max((index for index, message in enumerate(messages)
-                  if isinstance(_plain(message), dict) and _plain(message).get("role") == "user"), default=None)
-    if latest is None:
-        return False
-    return any(_inline_image_urls(_plain(message).get("content")) for message in messages[latest:]
-               if isinstance(_plain(message), dict))
+    found = False
+    for message in reversed(messages or []):
+        data = _plain(message)
+        if not isinstance(data, dict):
+            continue
+        found = found or bool(_inline_image_urls(data.get("content")))
+        if data.get("role") == "user":
+            return found
+    return False
 
 
 def image_recall_context(messages, tools, start=0):
@@ -603,6 +609,9 @@ class BridgeWorker:
         finally:
             with self._state_lock:
                 if active.sinks is not None and diagnostics_enabled():
+                    if active.last_tool_completion is not None:
+                        _log.info("ACP prompt %d after last tool completion %.3fs", rid,
+                                  time.monotonic() - active.last_tool_completion)
                     _log.info("ACP prompt %d finished %.3fs", rid, time.monotonic() - active.started)
                 active.finished.set()
                 if self._active is not None and self._active.rid == rid:
@@ -672,6 +681,7 @@ class BridgeWorker:
                                                 "task", "glob", "grep", "webfetch") else "unrecognized"
                 native[call_id] = (status or previous[0], update.get("kind") or previous[1], title)
                 if len(active.sinks) > 3 and incoming == "completed" and isinstance(update.get("content"), list):
+                    active.last_tool_completion = time.monotonic()
                     receipts = active.sinks[3]
                     for block in update["content"]:
                         content = block.get("content") if isinstance(block, dict) else None
@@ -692,12 +702,13 @@ class BridgeWorker:
         except (OSError, ValueError):
             pass
 
-    def new_session(self, timeout):
+    def new_session(self, timeout, *, enable_tools=True):
         servers = []
-        if self.mcp_key:
+        if self.mcp_key and enable_tools:
             servers.append({"name": "hermesbridge", "command": sys.executable,
                             "args": ["-I", os.path.abspath(mcp_relay.__file__)],
-                            "env": [{"name": "HERMES_MCP_RECEIPT_KEY", "value": self.mcp_key}]})
+                            "env": [{"name": "HERMES_MCP_RECEIPT_KEY", "value": self.mcp_key},
+                                    {"name": "HERMES_MCP_COMPACT_RECEIPTS", "value": "1"}]})
         result = self.request("session/new", {"cwd": self._cwd, "mcpServers": servers}, timeout=timeout)
         if not isinstance(result.get("sessionId"), str) or not result["sessionId"]:
             raise RuntimeError("OpenCode ACP did not return a session ID")
@@ -1008,14 +1019,19 @@ class OpenCodeACPClient(CompletionAPI):
             raise RuntimeError("OpenCode agent did not advertise image input; the new image was not sent. "
                                "Point auxiliary vision at an image-capable backend. No prompt was sent.")
         turn = secrets.token_hex(12) if worker.mcp_key else None
+        text_only = worker.mcp_key and (not tools or tool_choice == "none")
         if start == 0:
-            prompt = render_prompt(messages, tools, tool_choice, images=supported,
-                                   contract=mcp_relay.CONTRACT if turn else CONTRACT)
+            if text_only:
+                prompt = "Answer the following conversation directly. No tools are available.\n\n" + render_transcript(messages, supported)
+            else:
+                prompt = render_prompt(messages, tools, tool_choice, images=supported,
+                                       contract=mcp_relay.CONTRACT if turn else CONTRACT)
         else:
             prompt = render_delta(messages, start, images=supported)
-        prompt += image_recall_context(messages, tools, start)
-        if turn:
-            prompt += "\nTurn token: " + turn
+        if not text_only:
+            prompt += image_recall_context(messages, tools, start)
+            if turn:
+                prompt += "\nTurn token: " + turn
         images = []
         if supported:
             for message in messages[start:]:
@@ -1026,7 +1042,7 @@ class OpenCodeACPClient(CompletionAPI):
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
-            if turn and not isinstance(exc, UnadvertisedTool):
+            if turn and (text_only or not isinstance(exc, UnadvertisedTool)):
                 raise ToolProtocolError(f"[ACP-MCP-VALIDATION] {exc}. Check the requested tool schema and choice.") from exc
             # One in-session correction; the rejected reply never reaches Hermes.
             initial = usage
@@ -1057,8 +1073,8 @@ class OpenCodeACPClient(CompletionAPI):
                                         "No Hermes tool dispatched. Enable the MCP relay for structured calls.") from final_error
         return calls, content, reasoning, usage
 
-    def _open_session(self, worker, tools_signature, deadline, requested_model=None):
-        result = worker.new_session(seconds_left(deadline))
+    def _open_session(self, worker, tools_signature, deadline, requested_model=None, *, enable_tools=True):
+        result = worker.new_session(seconds_left(deadline), enable_tools=enable_tools)
         agent = "hermes-mcp" if worker.mcp_key else self.agent
         if worker.mcp_key and not any(agent in options(o) for o in _config_candidates(result, "mode")):
             raise ToolProtocolError(f"[ACP-MCP-AGENT {VERSION}] OpenCode did not offer hermes-mcp. "
@@ -1106,7 +1122,8 @@ class OpenCodeACPClient(CompletionAPI):
             except BaseException:
                 worker.forget(session)
                 raise
-        session = self._open_session(worker, tools_signature, deadline, requested_model)
+        session = self._open_session(worker, tools_signature, deadline, requested_model,
+                                     enable_tools=bool(tools) and tool_choice != "none")
         try:
             calls, content, reasoning, usage = self._prompt_session(
                 worker, session, messages, 0, tools=tools, tool_choice=tool_choice, deadline=deadline)

@@ -1,10 +1,12 @@
 """Stdio MCP relay. Encode requests for Hermes, which owns approval and execution."""
+import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import sys
+import zlib
 
 PREFIX = "HERMES_REQUEST_V1 "
 CONTRACT = ("Use the hermesbridge_request MCP tool for every Hermes tool request. "
@@ -20,8 +22,13 @@ def sign(key, payload):
     return hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
-def receipt(key, args):
+def receipt(key, args, *, compact=True):
     payload = json.dumps(dict(args, id="acp_" + secrets.token_hex(12)), separators=(",", ":"))
+    # Keep small receipts readable. Large arguments can dominate the model's next input.
+    if compact and 1024 <= len(payload) <= 4 * 1024 * 1024:
+        packed = "~" + base64.b64encode(zlib.compress(payload.encode(), 1)).decode("ascii")
+        if len(packed) * 2 < len(payload):
+            payload = packed
     return PREFIX + sign(key, payload) + " " + payload
 
 
@@ -31,13 +38,15 @@ def verify(key, turn, value):
     signature, _, payload = value[len(PREFIX):].partition(" ")
     if not signature.isascii() or not hmac.compare_digest(sign(key, payload), signature):
         return None
+    if payload.startswith("~"):
+        payload = zlib.decompress(base64.b64decode(payload[1:]))
     data = json.loads(payload)
     if data["turn"] == turn:
         return {"id": data["id"], "type": "function",
                 "function": {"name": data["name"], "arguments": data["arguments"]}}
 
 
-def handle(method, params, key):
+def handle(method, params, key, *, compact=False):
     if method == "initialize":
         versions = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
         version = params.get("protocolVersion")
@@ -53,12 +62,13 @@ def handle(method, params, key):
     args = params.get("arguments")
     valid = (params.get("name") == "request" and isinstance(args, dict) and set(args) == set(SCHEMA["required"])
              and isinstance(args["turn"], str) and isinstance(args["name"], str) and isinstance(args["arguments"], dict))
-    message = receipt(key, args) if valid else "Expected request(turn, name, arguments object)."
+    message = receipt(key, args, compact=compact) if valid else "Expected request(turn, name, arguments object)."
     return {"isError": not valid, "content": [{"type": "text", "text": message}]}
 
 
 def main():
     key = os.environ["HERMES_MCP_RECEIPT_KEY"]
+    compact = os.getenv("HERMES_MCP_COMPACT_RECEIPTS") == "1"
     for line in sys.stdin.buffer:
         try:
             request = json.loads(line)
@@ -72,7 +82,7 @@ def main():
             params = request.get("params", {})
             if not isinstance(params, dict):
                 raise ValueError()
-            result = handle(request.get("method"), params, key)
+            result = handle(request.get("method"), params, key, compact=compact)
             reply = {"result": result}
         except KeyError:
             reply = {"error": {"code": -32601, "message": "Unknown method"}}
