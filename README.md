@@ -138,6 +138,24 @@ hermes -p <profile> gateway status
 
 After the next sign-in, check status for the same profile and confirm that a Mattermost DM receives exactly one reply. Hermes uses a Windows scheduled task or a Startup-folder fallback. To remove automatic startup, run `hermes -p <profile> gateway stop` followed by `hermes -p <profile> gateway uninstall`.
 
+## Mattermost streaming (0.6.9)
+
+For progressive message edits, merge these settings into the Mattermost profile's `config.yaml` and restart the gateway that serves it:
+
+```yaml
+streaming:
+  enabled: true
+  transport: edit
+display:
+  platforms:
+    mattermost:
+      streaming: true
+```
+
+Hermes must request a stream. If you explicitly disabled `model.streaming`, enable it again. With the hermes-mcp or hermes-relay agent, a request with no available tools (or `tool_choice: none`) can show assistant text before OpenCode finishes the turn. The gateway controls how often the same post is edited. The bridge holds potential protocol markup for final validation.
+
+Requests that advertise tools keep their text buffered even if the user only asks a question. During these turns Mattermost can show the gateway's normal typing indicator. Actual tool calls and their reply are delivered after validation. Streaming changes the time to first visible text, while the worker stays occupied until the turn finishes.
+
 ## Diagnostics and token counts
 
 Set `HERMES_OPENCODE_ACP_DIAGNOSTICS=1` in the gateway environment to log recognized provider error names (`provider.quota` and `provider.auth`). At INFO level this option also logs worker startup or reuse, time waiting for the worker and prompt locks, and time from each ACP prompt RPC to its first update and completion. For tool turns the log also measures the interval between the last completed tool notification with content and the end of the ACP prompt. Timing records contain no transcript or filenames. Vendor messages, stderr and unknown error names are discarded. A request shares one timeout budget across queueing, worker initialization, session setup, prompting and repair. Waiting requests can expire without interrupting an active conversation. Session history is recorded before the next request can reuse the worker. A reused session is recreated once only on the known missing-session response before any update. Quota and authentication errors return immediately. Cancellation sends an ACP notification to the active prompt and allows up to 250 ms for it to finish before stopping the worker.

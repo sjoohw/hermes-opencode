@@ -4,6 +4,7 @@ The operator selects the OpenCode CLI (or its Windows batch launcher). All host
 work is returned as remote tool calls; this module never executes model tools.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 import asyncio
 import hashlib
 import json
@@ -576,7 +577,13 @@ class BridgeWorker:
                 raise TimeoutError(f"OpenCode ACP timed out writing {method}")
             if failures:
                 raise failures[0]
+            preview = _live_stream.get() if method == "session/prompt" else None
+            cancel_sent = False
             while True:
+                if preview and preview.closed.is_set() and not cancel_sent:
+                    self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                                "params": {"sessionId": active.session_id}})
+                    cancel_sent = True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"OpenCode ACP timed out during {method}")
@@ -700,6 +707,8 @@ class BridgeWorker:
             if kind == "agent_message_chunk" and content["text"] and active.trace_timing:
                 active.last_text = time.monotonic()
             sink.append(content["text"])
+            if kind == "agent_message_chunk" and len(active.sinks) > 4 and active.sinks[4] and not native:
+                active.sinks[4].append(content["text"])
 
     def _discard_stderr(self):
         try:
@@ -800,6 +809,109 @@ class BridgeWorker:
             self._sessions.clear()
 
 
+# Only the producing request's thread sees this value. The ACP reader receives
+# the same object via its active request sinks, never via shared client state.
+_live_stream = ContextVar("acp_live_stream", default=None)
+
+
+class TextPreview:
+    def __init__(self):
+        self.queue = queue.SimpleQueue()
+        self.closed = threading.Event()
+        self.sent = 0
+        self.pending = ""
+        self.held = False
+        self.model = DEFAULT_MODEL
+
+    def append(self, text):
+        if self.held or self.closed.is_set():
+            return
+        text = self.pending + text
+        if not self.sent:
+            text = text.lstrip()
+        # Hold possible markup or a receipt until the final reply is validated.
+        # A receipt prefix can straddle two ACP frames.
+        marker = mcp_relay.PREFIX
+        stop = re.search(r"<|" + re.escape(marker), text)
+        if stop:
+            text = text[:stop.start()]
+            self.held = True
+        tail = 0
+        if not self.held:
+            for size in range(min(len(marker) - 1, len(text)), 0, -1):
+                if text.endswith(marker[:size]):
+                    tail = size
+                    break
+        ready = (text[:-tail] if tail else text).rstrip()
+        self.pending = text[len(ready):]
+        if ready:
+            self.sent += len(ready)
+            self.queue.put(ready)
+
+
+class LiveTextStream:
+    def __init__(self, complete, kwargs):
+        self.preview = preview = TextPreview()
+        self.id = "acp_" + uuid.uuid4().hex
+        self.created = int(time.time())
+        self._finish = weakref.finalize(self, preview.closed.set)
+
+        def produce():
+            token = _live_stream.set(preview)
+            try:
+                preview.queue.put(complete(**kwargs))
+            except Exception as exc:
+                preview.queue.put(exc)
+            finally:
+                _live_stream.reset(token)
+
+        ctx = copy_context()
+        threading.Thread(target=ctx.run, args=(produce,), daemon=True).start()
+
+    def close(self):
+        self._finish()
+        self.preview.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        preview = self.preview
+        if preview.closed.is_set():
+            raise StopIteration
+        event = preview.queue.get()
+        if event is None or preview.closed.is_set():
+            raise StopIteration
+        if isinstance(event, Exception):
+            self.close()
+            raise event
+        if isinstance(event, str):
+            body, reasoning, model, finish, usage = event, None, preview.model, None, None
+        else:
+            self._finish()
+            choice = event.choices[0]
+            body = (choice.message.content or "")[preview.sent:]
+            reasoning = choice.message.reasoning
+            model, finish, usage = event.model, choice.finish_reason, event.usage
+        delta = Record(role="assistant", content=body or None, tool_calls=None,
+                       reasoning_content=reasoning, reasoning=reasoning)
+        return Record(id=self.id, object="chat.completion.chunk", created=self.created, model=model,
+                      choices=[Record(index=0, delta=delta, finish_reason=finish)], usage=usage)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            chunk = await asyncio.to_thread(next, self, None)
+        except asyncio.CancelledError:
+            self.close()
+            raise
+        if chunk is None:
+            raise StopAsyncIteration
+        return chunk
+
+
 class CompletionAPI:
     api_key = ""  # Hermes reads this during fallback activation. OpenCode owns credentials.
     HERMES_SKIP_TRANSPORT_WRAP = True
@@ -820,6 +932,9 @@ class CompletionAPI:
 
     def _create_chat_completion(self, *, model=None, messages=None, tools=None, tool_choice=None,
                                 timeout=None, stream=False, **kwargs):
+        if stream and (not tools or tool_choice == "none") and tool_choice in (None, "none", "auto"):
+            return LiveTextStream(self._create_chat_completion, dict(model=model, messages=messages,
+                               tools=tools, tool_choice=tool_choice, timeout=timeout))
         calls, content, reasoning, usage, model = self._run_prompt(messages, tools=tools,
                                                      tool_choice=tool_choice, timeout_seconds=timeout,
                                                      requested_model=None if model == DEFAULT_MODEL else model)
@@ -979,10 +1094,17 @@ class OpenCodeACPClient(CompletionAPI):
     def _send_prompt(worker, session, prompt, timeout, images=(), turn=None):
         text, reasoning, native = [], [], {}
         receipts = {}
+        preview = _live_stream.get()
+        if preview and preview.closed.is_set():
+            raise RuntimeError("OpenCode ACP stream was closed")
+        if preview:
+            preview.model = session_model(session.config)
+        # Only relay agents are configured to exclude native file and shell tools.
+        live_preview = preview if selected_value(session.config, "mode") in ("hermes-mcp", RELAY_AGENT) else None
         try:
             response = worker.request("session/prompt", {
                 "sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
-                sinks=(text, reasoning, native, receipts), timeout=timeout)
+                sinks=(text, reasoning, native, receipts, live_preview), timeout=timeout)
         except (RpcError, WorkerDied) as exc:
             if any(state[0] in NATIVE_RAN for state in native.values()):
                 raise ToolProtocolError(f"[ACP-TOOL-INTERRUPTED {VERSION}] OpenCode reported tool activity "
@@ -1056,6 +1178,9 @@ class OpenCodeACPClient(CompletionAPI):
         try:
             calls, content = parse_tool_calls(answer, tools, tool_choice)
         except ValueError as exc:
+            preview = _live_stream.get()
+            if preview and preview.sent:
+                raise ToolProtocolError("[ACP-STREAM] Invalid tool response during a text-only stream.") from exc
             if turn and (text_only or not isinstance(exc, UnadvertisedTool)):
                 raise ToolProtocolError(f"[ACP-MCP-VALIDATION] {exc}. Check the requested tool schema and choice.") from exc
             # One in-session correction; the rejected reply never reaches Hermes.
@@ -1186,7 +1311,11 @@ class OpenCodeACPClient(CompletionAPI):
                             body = render_content(last.get("content")).strip()
                             user_text = body.rsplit("\n[New message]\n", 1)[-1].strip()
                             if user_text in ("acp-check", "acp-chk", "!acp-check"):
-                                return self._check_relay(worker, deadline, requested_model)
+                                token = _live_stream.set(None)
+                                try:
+                                    return self._check_relay(worker, deadline, requested_model)
+                                finally:
+                                    _live_stream.reset(token)
                         calls, content, reasoning, usage, session = self._prompt_on_worker(
                             worker, messages, signatures, tools_signature,
                             tools=tools, tool_choice=tool_choice, deadline=deadline, requested_model=requested_model)

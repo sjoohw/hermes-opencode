@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -20,8 +21,8 @@ def envelope(name="check_connection", arguments=None, call_id="test-call"):
     return acp.OPEN_TAG + json.dumps(body) + acp.CLOSE_TAG
 
 
-def fake(scenario="normal"):
-    return acp.OpenCodeACPClient(command=sys.executable, args=[str(ROOT / "tests/fake_acp.py"), scenario])
+def fake(scenario="normal", *extra):
+    return acp.OpenCodeACPClient(command=sys.executable, args=[str(ROOT / "tests/fake_acp.py"), scenario, *extra])
 
 
 class ProtocolTests(unittest.TestCase):
@@ -211,9 +212,54 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(result.choices[0].message.tool_calls[0].function.name, "check_connection")
 
     def test_stream_shape_has_unknown_usage(self):
-        result = self.complete(self.use(), stream=True)
+        result = list(self.complete(self.use(), stream=True))
         self.assertEqual(result[0].choices[0].delta.content, "FAKE_ACP_OK")
         self.assertIsNone(result[0].usage)
+
+    def test_fragmented_protocol_text_is_held_before_display(self):
+        for fragments in (("hello <", "hermes_tool_call>{}"), ("hello HER", "MES_REQUEST_V1 payload")):
+            preview = acp.TextPreview()
+            for fragment in fragments:
+                preview.append(fragment)
+            self.assertEqual(preview.queue.get_nowait(), "hello")
+            self.assertTrue(preview.queue.empty())
+            self.assertTrue(preview.held)
+
+    def test_stream_yields_before_acp_can_finish(self):
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / "release"
+            item = fake("stream-good", str(marker))
+            self.addCleanup(item.close)
+            stream = self.complete(item, stream=True)
+            first = next(stream)
+            self.assertEqual(first.choices[0].delta.content, "first")
+            self.assertIsNone(first.choices[0].finish_reason)
+            marker.touch()
+            chunks = [first, *stream]
+            self.assertEqual("".join(c.choices[0].delta.content or "" for c in chunks), "first FAKE_ACP_OK")
+            self.assertEqual(chunks[-1].choices[0].finish_reason, "stop")
+
+    def test_tool_enabled_stream_rejects_unverified_turn(self):
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / "release"
+            marker.touch()
+            item = fake("stream-invalid", str(marker))
+            self.addCleanup(item.close)
+            with self.assertRaises(acp.NativeToolUsed):
+                self.complete(item, stream=True, tools=TOOLS)
+
+    def test_closed_stream_cancels_the_active_prompt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / "cancel"
+            item = fake("stream-cancel", str(marker))
+            self.addCleanup(item.close)
+            stream = self.complete(item, stream=True)
+            self.assertEqual(next(stream).choices[0].delta.content, "first")
+            stream.close()
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(marker.exists())
 
     def test_session_without_model_metadata_uses_display_label(self):
         result = self.complete(self.use("no-config"))

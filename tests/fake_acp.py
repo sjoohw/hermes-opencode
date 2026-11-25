@@ -69,7 +69,7 @@ for line in sys.stdin:
     elif method == "session/new":
         COUNTER += 1
         session_id = "fake-session-" + str(COUNTER)
-        values = {"mode": "plan", "model": "example/default-model"}
+        values = {"mode": "hermes-relay" if SCENARIO.startswith("stream-") else "plan", "model": "example/default-model"}
         if SCENARIO != "missing-effort":
             values["effort"] = "high"
         if SCENARIO == "cwd":
@@ -109,6 +109,21 @@ for line in sys.stdin:
                     update(session_id, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "partial"}})
                 send({"jsonrpc": "2.0", "id": rid, "error": error})
                 continue
+        if SCENARIO.startswith("stream-"):
+            update(session_id, {"sessionUpdate": "agent_message_chunk", "content": {"text": " first "}})
+            if SCENARIO == "stream-cancel":
+                msg = json.loads(sys.stdin.readline())
+                assert msg["method"] == "session/cancel"
+                with open(EXTRA, "w") as marker:
+                    marker.write("cancelled")
+                send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+                continue
+            until = time.monotonic() + 4
+            while not os.path.isfile(EXTRA) and time.monotonic() < until:
+                time.sleep(.01)
+            assert os.path.isfile(EXTRA)
+            if SCENARIO == "stream-invalid":
+                update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "bad", "status": "completed"})
         if SCENARIO == "cancel-aware":
             with open(EXTRA, "w") as handle:
                 handle.write("prompt")

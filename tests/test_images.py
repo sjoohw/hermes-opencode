@@ -147,7 +147,15 @@ class CallContractTests(unittest.TestCase):
         self.assertIsInstance(result, acp.Record)
         chunks = self.item.chat.completions.create(model=constants.DEFAULT_MODEL, messages=self.messages,
                                                    timeout=5, stream=True)
-        self.assertIsInstance(chunks, list)
+        self.assertEqual("".join(c.choices[0].delta.content or "" for c in chunks), "FAKE_ACP_OK")
+
+    def test_async_text_stream(self):
+        async def consume():
+            stream = await self.item.chat.completions.create(messages=self.messages, timeout=5, stream=True)
+            return [chunk async for chunk in stream]
+        chunks = asyncio.run(consume())
+        self.assertEqual("".join(c.choices[0].delta.content or "" for c in chunks), "FAKE_ACP_OK")
+        self.assertEqual(chunks[-1].choices[0].finish_reason, "stop")
 
     def test_inside_a_running_loop_the_result_is_awaitable(self):
         async def call():
