@@ -69,13 +69,15 @@ HERMES_OPENCODE_ACP_MCP=1
 
 If the profile is served by the default multiplexer, edit the environment loaded by the default gateway. Other profiles served by that process may inherit this setting. Restart the serving gateway once. The directory must exist and be accessible to the service account. The setting applies to the OpenCode process and its ACP sessions, including prewarm. Hermes tools retain their own workspace. OpenCode discovers project-local config and instructions from the new directory, so keep required provider and agent settings available through the gateway account's global config or an absolute `OPENCODE_CONFIG`. Unset the variable and restart to restore the inherited workspace.
 
-Send `acp-check` as a plain message to the Mattermost bot. With 0.6.8 and MCP enabled, expect:
+Send `acp-check` as a plain message to the Mattermost bot. With 0.6.10 and MCP enabled, expect:
 
 ```text
-ACP-CHECK 0.6.8 | agent=hermes-mcp | cwd_env=active | MCP PASS
+ACP-CHECK 0.6.10 | agent=hermes-mcp | cwd_env=active | MCP PASS
 ```
 
 `cwd_env=unset` means the serving process has no workspace setting. `cwd_env=different` means the worker uses a different directory. Check the running plugin version and restart the serving gateway after changing its environment. For a latency comparison, also confirm that the newly launched OpenCode instance log names the expected directory.
+
+From 0.6.10, an existing Hermes client checks the serving process's CWD environment setting again before prewarm and each new turn. If Hermes loads the variable after plugin initialization, the next request uses a worker for the configured directory. Requests already running finish on their original worker. On a workspace change the bridge rebuilds the ACP session from the conversation supplied by Hermes. Unsetting the variable restores the caller's original workspace. Editing a `.env` file still requires the gateway to load the change into its process environment.
 
 Use the same model, agent, prompt and CLI arguments to compare repository and empty-directory runs. Enable `HERMES_OPENCODE_ACP_DIAGNOSTICS=1` to measure lock wait, total prompt RPC time and the interval after the last assistant text chunk. That interval can include OpenCode tool processing or other work. Compare like-for-like runs and keep quota retries and cold starts separate.
 

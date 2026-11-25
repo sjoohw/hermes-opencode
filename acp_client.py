@@ -1365,24 +1365,54 @@ def release_client(key, slot, token):
 
 class SharedACPClient(CompletionAPI):
     def __init__(self, profile_home, **kwargs):
-        transport = OpenCodeACPClient(**kwargs)
-        self._kwargs = {**kwargs, "_shared_workspace": transport.workspace}
+        self._profile = os.path.normcase(os.path.realpath(profile_home))
+        self._kwargs = kwargs
+        self._fallback_workspace = os.path.abspath(kwargs.get("acp_cwd") or os.getcwd())
+        self._client_turn = threading.Lock()
         self._token = object()
-        key = (os.path.normcase(os.path.realpath(profile_home)), transport.workspace,
-               transport.command, tuple(transport.args), transport._auto_args, transport.agent,
-               tuple(os.getenv(k) for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME", "HERMES_OPENCODE_ACP_MCP")))
+        self._closed = False
+        transport = OpenCodeACPClient(**kwargs)
         with _shared_lock:
-            if key not in _shared_workers:
-                _shared_workers[key] = SharedWorker(transport)
-            self._slot = _shared_workers[key]
-            self._slot.references += 1
-        self._release = weakref.finalize(self, release_client, key, self._slot, self._token)
+            self._bind(transport)
         self.chat = Record(completions=Record(create=self._dispatch_completion))
         self.base_url = transport.base_url
 
+    def _bind(self, transport):
+        """Attach a reference under the pool lock. The finalizer owns that exact reference."""
+        self._workspace = transport.workspace
+        key = (self._profile, os.path.normcase(self._workspace),
+               transport.command, tuple(transport.args), transport._auto_args, transport.agent,
+               tuple(os.getenv(k) for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "XDG_CONFIG_HOME", "HERMES_OPENCODE_ACP_MCP")))
+        if key not in _shared_workers:
+            _shared_workers[key] = SharedWorker(transport)
+        self._slot = _shared_workers[key]
+        self._slot.references += 1
+        self._release = weakref.finalize(self, release_client, key, self._slot, self._token)
+
+    def _current_slot(self):
+        """Called between turns on this client. Other clients may still use its old slot."""
+        workspace = resolve_workspace(self._fallback_workspace)
+        with _shared_lock:
+            if self._closed:
+                raise RuntimeError("OpenCode ACP request was cancelled")
+            if os.path.normcase(workspace) == os.path.normcase(self._workspace):
+                return self._slot
+            previous = self._release
+            transport = OpenCodeACPClient(**self._kwargs, _shared_workspace=workspace)
+            self._bind(transport)
+        previous()
+        return self._slot
+
     def prewarm(self):
         """Prepare one unused session on this process's transport, without inference."""
-        slot = self._slot
+        if not self._client_turn.acquire(blocking=False):
+            return
+        try:
+            self._prewarm_slot(self._current_slot())
+        finally:
+            self._client_turn.release()
+
+    def _prewarm_slot(self, slot):
         if not slot.turn.acquire(blocking=False):
             return
         try:
@@ -1407,22 +1437,29 @@ class SharedACPClient(CompletionAPI):
 
     @property
     def is_closed(self):
-        return not self._release.alive
+        return self._closed
 
     def close(self):
-        self._release()
+        with _shared_lock:
+            self._closed = True
+            release = self._release
+        release()
 
     cancel = close
 
     def _run_prompt(self, messages, *, tools, tool_choice, timeout_seconds, requested_model=None):
         deadline = time.monotonic() + effective_timeout(timeout_seconds)
-        slot = self._slot
+        with acquire_until(self._client_turn, deadline, "client turn"):
+            slot = self._current_slot()
+            return self._run_on_slot(slot, messages, tools, tool_choice, deadline, requested_model)
+
+    def _run_on_slot(self, slot, messages, tools, tool_choice, deadline, requested_model):
         with acquire_until(slot.turn, deadline, "shared transport"):
             with _shared_lock:
                 if self.is_closed:
                     raise RuntimeError("OpenCode ACP request was cancelled")
                 if slot.transport is None:
-                    slot.transport = OpenCodeACPClient(**self._kwargs)
+                    slot.transport = OpenCodeACPClient(**self._kwargs, _shared_workspace=self._workspace)
                 transport = slot.transport
                 slot.active = self._token
             try:

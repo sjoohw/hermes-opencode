@@ -71,6 +71,64 @@ class IsolationAndSignatureTests(unittest.TestCase):
                     chat.close()
                     warm.close()
 
+    def test_late_workspace_rebinds_existing_client_and_joins_new_client(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": ""}):
+            kwargs = dict(command=sys.executable, args=[str(ROOT / "tests/fake_acp.py"), "cwd"],
+                          acp_cwd=os.getcwd())
+            item = acp.SharedACPClient("late", **kwargs)
+            try:
+                item.prewarm()
+                old_worker = item._slot.transport._worker
+                os.environ["HERMES_OPENCODE_ACP_CWD"] = folder
+                newer = acp.SharedACPClient("late", **kwargs)
+                try:
+                    self.assertEqual(json.loads(content(complete(item))), [folder, folder])
+                    self.assertIs(item._slot, newer._slot)
+                    self.assertTrue(old_worker.dead)
+                    os.environ["HERMES_OPENCODE_ACP_CWD"] = "invalid"
+                    with self.assertRaisesRegex(ValueError, "ACP-CWD"):
+                        complete(item)
+                    del os.environ["HERMES_OPENCODE_ACP_CWD"]
+                    self.assertEqual(json.loads(content(complete(item))), [os.getcwd()] * 2)
+                finally:
+                    newer.close()
+            finally:
+                item.close()
+
+    def test_workspace_change_allows_active_old_turn_to_finish(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": ""}):
+            clients = [acp.SharedACPClient("busy", command=sys.executable,
+                       args=[str(ROOT / "tests/fake_acp.py"), "cwd"]) for _ in range(2)]
+            first, second = clients
+            entered, release = threading.Event(), threading.Event()
+            try:
+                first.prewarm()
+                old = first._slot.transport._worker
+                remember = old.remember
+                def hold_commit(*args):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("active request was never released")
+                    remember(*args)
+                with patch.object(old, "remember", hold_commit), ThreadPoolExecutor(2) as pool:
+                    active = pool.submit(complete, first)
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        os.environ["HERMES_OPENCODE_ACP_CWD"] = folder
+                        queued = pool.submit(complete, first)
+                        self.assertEqual(json.loads(content(complete(second))), [folder, folder])
+                        self.assertFalse(old.dead)
+                    finally:
+                        release.set()
+                    self.assertEqual(json.loads(content(active.result())), [os.getcwd()] * 2)
+                    self.assertEqual(json.loads(content(queued.result())), [folder, folder])
+                    self.assertIs(first._slot, second._slot)
+                    self.assertTrue(old.dead)
+            finally:
+                release.set()
+                first.close()
+                second.close()
+
     def test_invalid_workspace_fails_before_launch(self):
         for invalid in ("relative", os.path.abspath(__file__)):
             with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": invalid}):
