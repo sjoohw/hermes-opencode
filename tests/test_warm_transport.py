@@ -57,7 +57,8 @@ class IsolationAndSignatureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="acp workspace ") as folder:
             with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": folder}):
                 clients = [acp.SharedACPClient("profile", command=sys.executable,
-                           args=[str(ROOT / "tests/fake_acp.py"), "cwd"]) for _ in range(2)]
+                           args=[str(ROOT / "tests/fake_acp.py"), "cwd"], acp_cwd=caller_dir)
+                           for caller_dir in (None, parent_cwd)]
                 warm, chat = clients
                 try:
                     warm.prewarm()
@@ -74,7 +75,7 @@ class IsolationAndSignatureTests(unittest.TestCase):
         for invalid in ("relative", os.path.abspath(__file__)):
             with patch.dict(os.environ, {"HERMES_OPENCODE_ACP_CWD": invalid}):
                 with self.assertRaisesRegex(ValueError, "ACP-CWD"):
-                    fake()
+                    acp.OpenCodeACPClient(command=sys.executable, acp_cwd=os.getcwd())
 
     def test_message_signature_ignores_presentation_fields(self):
         first = {

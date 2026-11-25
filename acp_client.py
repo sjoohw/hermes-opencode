@@ -836,19 +836,23 @@ class CompletionAPI:
                        finish_reason=result.choices[0].finish_reason)], usage=usage)]
 
 
+def resolve_workspace(acp_cwd):
+    configured = os.getenv("HERMES_OPENCODE_ACP_CWD", "").strip()
+    if configured and not (os.path.isabs(configured) and os.path.isdir(configured)):
+        raise ValueError("[ACP-CWD] Set HERMES_OPENCODE_ACP_CWD to an existing absolute directory "
+                         "accessible to the gateway account.")
+    return os.path.abspath(configured or acp_cwd or os.getcwd())
+
+
 class OpenCodeACPClient(CompletionAPI):
 
     def __init__(self, *, command=None, args=None, acp_command=None, acp_args=None, acp_cwd=None,
-                 agent=None, **kwargs):
+                 agent=None, _shared_workspace=None, **kwargs):
         self.command = acp_command or command or opencode_command()
         self._auto_args = not (acp_args or args or os.getenv(ARGS_ENV, "").strip())
         self.args = list(acp_args or args or opencode_args())
         self.agent = agent or opencode_agent()
-        env_cwd = os.getenv("HERMES_OPENCODE_ACP_CWD", "").strip()
-        if not acp_cwd and env_cwd and not (os.path.isabs(env_cwd) and os.path.isdir(env_cwd)):
-            raise ValueError("[ACP-CWD] Set HERMES_OPENCODE_ACP_CWD to an existing absolute directory "
-                             "accessible to the gateway account.")
-        self.workspace = os.path.abspath(acp_cwd or env_cwd or os.getcwd())
+        self.workspace = _shared_workspace or resolve_workspace(acp_cwd)
         self.base_url = "acp://hermes-opencode-acp"
         self.chat = Record(completions=Record(create=self._dispatch_completion))
         self.is_closed = False
@@ -1233,7 +1237,7 @@ def release_client(key, slot, token):
 class SharedACPClient(CompletionAPI):
     def __init__(self, profile_home, **kwargs):
         transport = OpenCodeACPClient(**kwargs)
-        self._kwargs = {**kwargs, "acp_cwd": transport.workspace}
+        self._kwargs = {**kwargs, "_shared_workspace": transport.workspace}
         self._token = object()
         key = (os.path.normcase(os.path.realpath(profile_home)), transport.workspace,
                transport.command, tuple(transport.args), transport._auto_args, transport.agent,
