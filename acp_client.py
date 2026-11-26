@@ -680,19 +680,29 @@ class BridgeWorker:
         if kind in ("tool_call", "tool_call_update"):
             # Never executed here, but recorded so a native run cannot pass silently.
             if native is not None:
-                call_id = str(update.get("toolCallId", len(native)))
-                previous = native.get(call_id, ("pending", None, None))
+                call_id = update.get("toolCallId")
+                identified = isinstance(call_id, str) and bool(call_id)
+                if not identified:
+                    call_id = object()  # Never correlate separate unidentified events.
+                previous = native.get(call_id, ("pending", None, None, False))
                 incoming = update.get("status")
-                status = incoming if incoming in NATIVE_RAN or previous[0] not in NATIVE_RAN else previous[0]
+                ran = previous[3] or incoming in NATIVE_RAN
+                if incoming == "failed" or previous[0] == "failed":
+                    status = "failed"
+                elif incoming == "completed" or previous[0] == "completed":
+                    status = "completed"
+                else:
+                    status = "in_progress" if ran else "pending"
                 title = previous[2]
                 if title is None and isinstance(update.get("title"), str):
                     # Titles can contain command lines and paths. Retain only known identifiers.
                     value = update["title"]
                     title = value if value in ("hermesbridge_request", "bash", "edit", "read", "write",
                                                 "task", "glob", "grep", "webfetch") else "unrecognized"
-                native[call_id] = (status or previous[0], update.get("kind") or previous[1], title)
-                if len(active.sinks) > 3 and incoming == "completed" and isinstance(update.get("content"), list):
+                native[call_id] = (status, update.get("kind") or previous[1], title, ran)
+                if incoming == "completed":
                     active.last_tool_completion = time.monotonic()
+                if identified and len(active.sinks) > 3 and isinstance(update.get("content"), list):
                     receipts = active.sinks[3]
                     for block in update["content"]:
                         content = block.get("content") if isinstance(block, dict) else None
@@ -1106,18 +1116,21 @@ class OpenCodeACPClient(CompletionAPI):
                 "sessionId": session.session_id, "prompt": [{"type": "text", "text": prompt}, *images]},
                 sinks=(text, reasoning, native, receipts, live_preview), timeout=timeout)
         except (RpcError, WorkerDied) as exc:
-            if any(state[0] in NATIVE_RAN for state in native.values()):
+            if any(state[3] for state in native.values()):
                 raise ToolProtocolError(f"[ACP-TOOL-INTERRUPTED {VERSION}] OpenCode reported tool activity "
                                         f"before {type(exc).__name__}. Check the action outcome before resending.") from exc
             raise
         if response.get("stopReason") == "cancelled":
             raise RuntimeError("OpenCode ACP request was cancelled")
         calls = []
-        for call_id, (status, kind, title) in native.items():
+        for call_id, (status, kind, title, ran) in native.items():
             if turn and title == "hermesbridge_request" and status == "failed":
                 raise ToolProtocolError(f"[ACP-MCP-CALL {VERSION}] hermesbridge_request failed inside OpenCode. "
                                         "Check MCP agent permissions and that its Python executable is accessible.")
-            if status not in NATIVE_RAN:
+            if turn and title == "hermesbridge_request" and status == "in_progress":
+                raise ToolProtocolError(f"[ACP-MCP-INCOMPLETE {VERSION}] ACP prompt ended before the relay "
+                                        "reported completion for this call. No Hermes tool dispatched.")
+            if not ran:
                 continue
             values = receipts.get(call_id, set())
             call = (mcp_relay.verify(worker.mcp_key, turn, next(iter(values)))

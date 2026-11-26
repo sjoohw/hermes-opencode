@@ -40,6 +40,30 @@ class MCPTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             acp.parse_tool_calls(answer, [])
 
+    def test_started_relay_reports_failure_or_missing_completion(self):
+        start, end = self.events()
+        running = dict(start, status="in_progress")
+        failed = dict(end, status="failed")
+        with self.assertRaisesRegex(acp.ToolProtocolError, "ACP-MCP-CALL"):
+            self.send([running, failed])
+        with self.assertRaisesRegex(acp.ToolProtocolError, "ACP-MCP-INCOMPLETE"):
+            self.send([running])
+        with self.assertRaises(acp.NativeToolUsed):
+            self.send([dict(running, title="bash"), failed])
+
+    def test_receipt_and_completion_can_arrive_as_separate_updates(self):
+        start, end = self.events()
+        content_only = dict(end)
+        del content_only["status"]
+        completion = dict(end)
+        del completion["content"]
+        for updates in ([content_only, completion], [completion, content_only]):
+            answer = self.send([dict(start, status="in_progress"), *updates])
+            calls, _ = acp.parse_tool_calls(answer, [{"function": {"name": "read"}}])
+            self.assertEqual(len(calls), 1)
+        with self.assertRaisesRegex(acp.ToolProtocolError, "ACP-MCP-INCOMPLETE"):
+            self.send([dict(start, status="in_progress"), content_only])
+
     def test_text_only_session_omits_mcp_server(self):
         worker = object.__new__(acp.BridgeWorker)
         worker.mcp_key, worker._cwd = self.key, "."
